@@ -1436,6 +1436,11 @@ class Config:
             "SCHEDULE_TIME",
             "SCHEDULE_TIMES",
             "SCHEDULE_RUN_IMMEDIATELY",
+            # Same startup-key treatment as SCHEDULE_RUN_IMMEDIATELY: a
+            # bootstrap process env value (docker -e / compose / shell
+            # export) that differs from the persisted .env must win, while
+            # a WebUI .env edit still takes effect on reload (PR #2366).
+            "SCHEDULE_STARTUP_DEDUP",
         }
     )
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
