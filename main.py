@@ -639,6 +639,63 @@ def _resolve_portfolio_stock_codes(args: argparse.Namespace) -> Optional[List[st
     return stock_codes
 
 
+def _resolve_gate_expected_stock_codes(
+    config: Config,
+    args: argparse.Namespace,
+    *,
+    stock_codes: Optional[List[str]] = None,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Resolve the startup dedup gate's expected list like the run entry.
+
+    Mirrors ``run_full_analysis``' real target resolution (Futu portfolio
+    first, then the ``STOCK_LIST`` .env hot-reload, then the trading-day
+    filter) so the skip decision uses what THIS startup would actually
+    analyze instead of a possibly stale ``config.stock_list`` snapshot
+    (second-round review blockers OR-COR-e59aed48 / OR-COR-c4971c31).
+
+    Returns ``(expected_codes, fail_open_reason)``:
+
+    - Portfolio mode: the trading-day-filtered live position codes. An
+      empty filtered list (no positions / no open market) can never prove
+      coverage, so it returns a fail-open reason instead — the run itself
+      decides downstream, the gate never skips on it.
+    - Non-portfolio mode: mirrors the run's refresh condition verbatim
+      (``stock_codes is None`` on the schedule path; the refresh is
+      idempotent on the same config object the run reuses) and keeps the
+      existing semantics for an empty config watchlist (pure-review dedup).
+    - Any resolution failure fails open too: ``None`` expected codes plus a
+      reason string for the gate log. Never miss a run outranks never
+      re-run.
+    """
+    try:
+        portfolio_stock_codes = _resolve_portfolio_stock_codes(args)
+        if portfolio_stock_codes is not None:
+            filtered_codes, _, _ = _compute_trading_day_filter(
+                config, args, portfolio_stock_codes
+            )
+            if not filtered_codes:
+                return (None, "portfolio mode resolved no tradable targets")
+            return (filtered_codes, None)
+
+        # Issue #529: keep this condition verbatim-identical to
+        # run_full_analysis — hot-reload STOCK_LIST from .env before a
+        # config-list run. The gate and the run share the same config
+        # object, so this refresh converges to what the run would do anyway.
+        if stock_codes is None:
+            config.refresh_stock_list()
+        effective_codes = (
+            stock_codes
+            if stock_codes is not None
+            else getattr(config, "stock_list", None) or []
+        )
+        filtered_codes, _, _ = _compute_trading_day_filter(
+            config, args, effective_codes
+        )
+        return (filtered_codes, None)
+    except Exception as exc:  # noqa: BLE001 - the gate must never block a run
+        return (None, f"target resolution failed: {exc}")
+
+
 def _prime_daily_market_context(
     config: Config,
     pipeline: Any,
@@ -1919,29 +1976,41 @@ def main() -> int:
                     and not force_run
                     and getattr(runtime_config, "schedule_startup_dedup", True)
                 ):
-                    # Expected list = what THIS startup would analyze after
-                    # the trading-day filter (schema 2 coverage gate). Only
-                    # used for the skip decision; the run below still applies
-                    # its own filter. getattr keeps minimal config stand-ins
-                    # (no stock_list attribute) on the fail-open path.
-                    expected_codes, _, _ = _compute_trading_day_filter(
-                        runtime_config,
-                        args,
-                        getattr(runtime_config, "stock_list", None) or [],
-                    )
-                    decision = should_skip_startup_immediate_run(
-                        runtime_config,
-                        expected_stock_codes=expected_codes,
-                    )
-                    if decision.skip:
-                        logger.info(
-                            "启动立即执行已跳过:当日全量分析已完成(%s)",
-                            decision.reason,
+                    # Expected list = what THIS startup would actually
+                    # analyze, resolved through the same real target chain
+                    # as run_full_analysis (Futu portfolio first, .env
+                    # hot-reload second, trading-day filter last; schema 2
+                    # coverage gate). Only used for the skip decision; the
+                    # run below still applies its own filter. A resolution
+                    # failure or an empty portfolio resolution comes back
+                    # as a fail-open reason instead of an expected list —
+                    # the gate then never skips.
+                    expected_codes, fail_open_reason = (
+                        _resolve_gate_expected_stock_codes(
+                            runtime_config,
+                            args,
+                            stock_codes=scheduled_stock_codes,
                         )
-                        return
-                    logger.info(
-                        "启动立即执行去重检查通过:%s", decision.reason
                     )
+                    if fail_open_reason is not None:
+                        logger.info(
+                            "启动立即执行去重检查 fail-open(%s)，照常执行分析",
+                            fail_open_reason,
+                        )
+                    else:
+                        decision = should_skip_startup_immediate_run(
+                            runtime_config,
+                            expected_stock_codes=expected_codes,
+                        )
+                        if decision.skip:
+                            logger.info(
+                                "启动立即执行已跳过:当日全量分析已完成(%s)",
+                                decision.reason,
+                            )
+                            return
+                        logger.info(
+                            "启动立即执行去重检查通过:%s", decision.reason
+                        )
                 elif gated and force_run:
                     logger.info("--force-run 指定,跳过启动去重检查")
                 if scheduled_for is None:

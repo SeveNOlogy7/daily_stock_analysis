@@ -18,6 +18,10 @@ Design rules (see docs/CHANGELOG.md):
   trading-day filter) must be a subset of the marker's covered
   ``stock_codes``. A morning run that only covered the CN market therefore
   re-runs after the US market opens, while a watchlist shrink still skips.
+- The caller computes ``expected_stock_codes`` through the real target
+  resolution chain (live portfolio first, ``STOCK_LIST`` .env hot-reload
+  second); a failed or empty portfolio resolution never reaches this
+  decision — the caller fails open and runs instead.
 - The ``stock_list_fingerprint`` field is kept for observability only
   since schema 2 and never participates in the decision; the stock codes
   are normalized with plain ``str(code)`` on both the writer and the gate

@@ -546,6 +546,12 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
         defaults.update(overrides)
 
         class _DummyConfig(SimpleNamespace):
+            def refresh_stock_list(self):
+                # The gate mirrors the run entry's STOCK_LIST .env hot-reload;
+                # stand-in configs keep it a no-op (same shape as the
+                # RealRun harness dummy below).
+                pass
+
             def validate(self):
                 return []
 
