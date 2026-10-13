@@ -29,6 +29,7 @@ from tests.litellm_stub import ensure_litellm_stub
 ensure_litellm_stub()
 
 import main
+from src.analyzer import AnalysisResult
 from src.config import Config
 import src.core.analysis_run_marker as analysis_run_marker
 from src.core.analysis_run_marker import (
@@ -271,6 +272,33 @@ class AnalysisRunMarkerUnitTestCase(unittest.TestCase):
         decision = should_skip_startup_immediate_run(self.config)
         self.assertFalse(decision.skip, decision.reason)
         self.assertIn("stock list changed", decision.reason)
+
+    def test_gate_requires_covered_superset(self):
+        # Blocker OR-COR-9a7cb728: the marker's covered ``stock_codes`` being
+        # a strict subset of the currently expected list (e.g. only the CN
+        # market was covered in a morning run; US opens later the same day)
+        # must reopen the gate instead of skipping. The fingerprint is
+        # deliberately kept identical on both sides so ONLY the coverage
+        # semantics can decide the outcome; the schema version tracks the
+        # module constant so this test fails before AND after the schema bump.
+        subset_config = _marker_config(
+            self._tmp.name, stock_list=("600519", "AAPL")
+        )
+        self._write_raw_marker(
+            _raw_marker_payload(
+                schema_version=analysis_run_marker.MARKER_SCHEMA_VERSION,
+                stock_list_fingerprint=compute_stock_list_fingerprint(
+                    subset_config.stock_list
+                ),
+                stock_codes=["600519"],
+            )
+        )
+        decision = should_skip_startup_immediate_run(subset_config)
+        self.assertFalse(
+            decision.skip,
+            "covered stock_codes must cover the whole expected list to skip",
+        )
+        self.assertIn("AAPL", decision.reason)
 
     def test_kill_switch_disabled_executes_even_with_matching_marker(self):
         self._record()
@@ -622,6 +650,302 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
             self.assertEqual(fake_analysis.call_count, 1)
             self.assertIn("--force-run 指定,跳过启动去重检查", self._joined_logs())
             self.assertNotIn("启动立即执行已跳过", self._joined_logs())
+
+    def test_cross_market_second_phase_reopens_gate(self):
+        # Blocker OR-COR-9a7cb728 (integration, two phases): the morning
+        # startup run covered only the CN stock; after the US market opens
+        # the same day a restart must re-run because the marker's covered
+        # stock_codes do not include AAPL. The fingerprint is identical on
+        # both sides (written over the full watchlist), so only the covered
+        # subset can decide. get_open_markets_today is the single time
+        # source of the trading-day filter (offline ZoneInfo + local
+        # holiday table), patched here to claim both markets are open.
+        config = self._make_config(
+            stock_list=["600519", "AAPL"],
+            trading_day_check_enabled=True,
+        )
+        record_config = SimpleNamespace(
+            database_path=config.database_path,
+            stock_list=list(config.stock_list),
+        )
+        record_analysis_run_marker(
+            record_config,
+            scope="full",
+            stock_codes=["600519"],
+            market_review_requested=False,
+            market_review_completed=None,
+        )
+        with patch(
+            "src.core.trading_calendar.get_open_markets_today",
+            return_value={"cn", "us"},
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args()
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "second phase with a not-fully-covered marker must execute",
+                )
+                self.assertIn("启动立即执行去重检查通过", self._joined_logs())
+                self.assertNotIn("启动立即执行已跳过", self._joined_logs())
+
+    def _real_config_from_env(self):
+        """Build a REAL Config through the production resolution chain.
+
+        ``Config._load_from_env()`` reads the process env and the active
+        ``ENV_FILE`` (set up by ``setUp``) — no SimpleNamespace shortcuts —
+        so the SCHEDULE_STARTUP_DEDUP value under test comes from the same
+        ``_resolve_env_value`` path production uses.
+        """
+        with patch.object(Config, "_parse_litellm_yaml", return_value=[]):
+            with patch.object(
+                Config, "_parse_stock_email_groups", return_value=[]
+            ):
+                Config.reset_instance()
+                try:
+                    return Config._load_from_env()
+                finally:
+                    Config.reset_instance()
+
+    def test_kill_switch_process_env_bypasses_gate_with_real_config(self):
+        # Blockers OR-COM-cf8f915a / OR-COM-440796b8: the kill switch must
+        # honor an explicit process-env value (docker -e / compose
+        # environment / shell export) that differs from the persisted .env,
+        # exactly like SCHEDULE_RUN_IMMEDIATELY. The .env keeps the dedup
+        # enabled; the process env disables it.
+        self.env_path.write_text(
+            "\n".join(
+                [
+                    "STOCK_LIST=600519",
+                    "SCHEDULE_ENABLED=true",
+                    "SCHEDULE_RUN_IMMEDIATELY=true",
+                    "SCHEDULE_TIME=23:59",
+                    "SCHEDULE_TIMES=",
+                    "MARKET_REVIEW_ENABLED=false",
+                    "TRADING_DAY_CHECK_ENABLED=false",
+                    "SCHEDULE_STARTUP_DEDUP=true",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"SCHEDULE_STARTUP_DEDUP": "false"}):
+            real_config = self._real_config_from_env()
+
+        self.assertFalse(
+            real_config.schedule_startup_dedup,
+            "process env SCHEDULE_STARTUP_DEDUP=false must override .env",
+        )
+
+        self._preset_full_marker(real_config)
+        with self._patched_schedule_main(
+            real_config, self._make_args()
+        ) as (task, run_immediately, fake_analysis):
+            self.assertTrue(run_immediately)
+
+            task()
+
+            self.assertEqual(fake_analysis.call_count, 1)
+            self.assertNotIn("启动立即执行已跳过", self._joined_logs())
+
+
+def _make_fake_pipeline_cls(results, report_path):
+    """Build a fresh ``StockAnalysisPipeline`` stand-in (AD-D harness).
+
+    The fake must be patched at ``src.core.pipeline.StockAnalysisPipeline``:
+    ``run_full_analysis`` imports the pipeline locally (``from src.core.pipeline
+    import StockAnalysisPipeline``), which silently shadows any
+    ``main.StockAnalysisPipeline`` attribute patch. ``results`` is returned
+    by ``run()`` verbatim; ``report_path`` simulates a persisted local
+    summary report so the deferred report-save failure branch stays ``None``
+    and cannot mask the marker contract under test.
+    """
+
+    class _FakeStockAnalysisPipeline:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.notifier = SimpleNamespace(
+                is_available=lambda: False,
+                send=lambda *args, **kwargs_: False,
+                generate_aggregate_report=lambda *args, **kwargs_: "",
+            )
+            self.analyzer = SimpleNamespace()
+            self.search_service = SimpleNamespace()
+            self._last_local_report_path = str(report_path)
+            self.run_calls = []
+
+        def run(self, **kwargs):
+            self.run_calls.append(kwargs)
+            return list(results)
+
+    return _FakeStockAnalysisPipeline
+
+
+class RealRunClosureMarkerTestCase(unittest.TestCase):
+    """Blocker1/4 closure harness: REAL ``main.run_full_analysis``.
+
+    The previous integration tests patched ``main.run_full_analysis``
+    outright, so the marker-write path (the very code the review flagged)
+    never executed. Here only the ``StockAnalysisPipeline`` boundary and
+    the network/filesystem collaborators are patched; the whole closure —
+    including the marker write — is real and offline.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.report_path = Path(self.temp_dir.name) / "report.md"
+        self.config = self._make_config()
+        self.args = self._make_args()
+        self.marker_path = analysis_run_marker_path(self.config)
+
+    # -- builders ---------------------------------------------------------
+
+    def _make_config(self, **overrides):
+        defaults = {
+            "log_dir": self.temp_dir.name,
+            "database_path": str(
+                Path(self.temp_dir.name) / "data" / "stock_analysis.db"
+            ),
+            "stock_list": ["600519", "000001"],
+            "market_review_enabled": False,
+            "daily_market_context_enabled": False,
+            "market_review_region": "cn",
+            "trading_day_check_enabled": False,
+            "merge_email_notification": False,
+            "single_stock_notify": False,
+            "analysis_delay": 0,
+            "report_type": "simple",
+            "report_language": "zh",
+            "schedule_enabled": True,
+            "schedule_startup_dedup": True,
+        }
+        defaults.update(overrides)
+
+        class _DummyConfig(SimpleNamespace):
+            def refresh_stock_list(self):
+                pass
+
+            def validate(self):
+                return []
+
+        return _DummyConfig(**defaults)
+
+    def _make_args(self, **overrides):
+        defaults = {
+            "debug": False,
+            "stocks": None,
+            "portfolio": "",
+            "webui": False,
+            "webui_only": False,
+            "serve": False,
+            "serve_only": False,
+            "host": None,
+            "port": None,
+            "backtest": False,
+            "market_review": False,
+            "schedule": True,
+            "no_run_immediately": False,
+            "no_notify": True,
+            "check_notify": False,
+            "no_market_review": False,
+            "dry_run": False,
+            "workers": 1,
+            "force_run": False,
+            "single_notify": False,
+            "no_context_snapshot": True,
+        }
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _analysis_result(self, code):
+        return AnalysisResult(
+            code=code,
+            name=f"stock-{code}",
+            sentiment_score=60,
+            trend_prediction="震荡",
+            operation_advice="观望",
+        )
+
+    def _run_real_full_analysis(
+        self,
+        *,
+        results,
+        market_review_report=None,
+        config=None,
+        args=None,
+    ):
+        config = config if config is not None else self.config
+        args = args if args is not None else self.args
+        fake_cls = _make_fake_pipeline_cls(results, self.report_path)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("src.core.pipeline.StockAnalysisPipeline", fake_cls)
+            )
+            stack.enter_context(
+                patch("main._refresh_stock_index_cache_for_analysis")
+            )
+            stack.enter_context(patch("main._run_auto_backtest"))
+            stack.enter_context(
+                patch(
+                    "main._prime_daily_market_context",
+                    return_value=("", ""),
+                )
+            )
+            if market_review_report is not None:
+                stack.enter_context(
+                    patch(
+                        "main._run_market_review_with_shared_lock",
+                        return_value=market_review_report,
+                    )
+                )
+            return main.run_full_analysis(config, args)
+
+    # -- cases ------------------------------------------------------------
+
+    def test_partial_stock_failure_must_not_record_full_marker(self):
+        # Blocker OR-COR-0438bcbe: 600519 succeeds, 000001 fails (the fake
+        # pipeline boundary returns only the successful result, mirroring
+        # the real pipeline contract of returning just the successes).
+        results = [self._analysis_result("600519")]
+
+        result = self._run_real_full_analysis(results=results)
+
+        # Upstream lenient semantics preserved: partial success still True.
+        self.assertTrue(result)
+        self.assertFalse(
+            self.marker_path.exists(),
+            "startup dedup marker must NOT be recorded when a stock "
+            "target failed",
+        )
+
+    def test_all_stocks_failed_with_market_review_must_not_record_full_marker(
+        self,
+    ):
+        # Blocker OR-COR-51dff048: every stock target fails, but the market
+        # review succeeds and produces a report — the run must not record a
+        # full-scope marker (the review must not resurrect the marker).
+        config = self._make_config(market_review_enabled=True)
+        marker_path = analysis_run_marker_path(config)
+
+        result = self._run_real_full_analysis(
+            results=[],
+            market_review_report="# 大盘复盘（mock）",
+            config=config,
+        )
+
+        # Upstream lenient semantics preserved: review success still True.
+        self.assertTrue(result)
+        self.assertFalse(
+            marker_path.exists(),
+            "startup dedup marker must NOT be recorded when every stock "
+            "target failed, even with a successful market review",
+        )
 
 
 if __name__ == "__main__":
