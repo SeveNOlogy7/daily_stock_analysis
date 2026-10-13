@@ -823,6 +823,233 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
             self.assertEqual(fake_analysis.call_count, 1)
             self.assertNotIn("启动立即执行已跳过", self._joined_logs())
 
+    # -- second-round review blockers (OR-COR-e59aed48 / OR-COR-c4971c31) --
+    #
+    # The gate must compute its expected list through the SAME real target
+    # resolution chain the run entry uses (Futu portfolio first, .env
+    # hot-reload second), not ``config.stock_list``. All cases below drive
+    # the real task() chain; ``run_full_analysis`` stays the faked boundary
+    # and the broker resolver is patched (zero network, zero real broker).
+
+    def test_new_futu_position_reopens_gate(self):
+        # Scenario 1: with --portfolio futu the run analyzes the LIVE
+        # positions resolved at the run entry. A marker that only covers the
+        # old watchlist must not skip a startup whose positions gained a new
+        # code; the gate has to consult the real portfolio resolution.
+        config = self._make_config()
+        self._preset_full_marker(config)  # covered=["600519"]
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            return_value=["600519", "000001"],
+        ) as fake_resolver:
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                fake_resolver.assert_called_once()
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "a new Futu position outside the covered marker must re-run",
+                )
+                joined = self._joined_logs()
+                self.assertIn("启动立即执行去重检查通过", joined)
+                self.assertIn("000001", joined)
+                self.assertNotIn("启动立即执行已跳过", joined)
+
+    def test_covered_portfolio_targets_still_skip(self):
+        # Guard against over-fixing: portfolio positions fully covered by
+        # today's marker must still skip.
+        config = self._make_config()
+        self._preset_full_marker(config)  # covered=["600519"]
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            return_value=["600519"],
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(fake_analysis.call_count, 0)
+                self.assertIn("启动立即执行已跳过", self._joined_logs())
+
+    def test_pure_portfolio_empty_watchlist_new_position_reopens_gate(self):
+        # Scenario 2: pure-portfolio deployment (empty persisted watchlist).
+        # The old gate computed expected=[] from config.stock_list, which is
+        # vacuously covered by any marker and skipped the run; the real run
+        # would have analyzed the live positions, so a new position must
+        # re-open the gate.
+        config = self._make_config(stock_list=[])
+        self._preset_full_marker(config, fingerprint_codes=["600519"])
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            return_value=["600519", "000001"],
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "empty watchlist + live positions must not be a vacuous skip",
+                )
+                joined = self._joined_logs()
+                self.assertIn("启动立即执行去重检查通过", joined)
+                self.assertIn("000001", joined)
+                self.assertNotIn("启动立即执行已跳过", joined)
+
+    def test_covered_pure_portfolio_targets_still_skip(self):
+        # Guard: pure-portfolio deployment whose live positions are fully
+        # covered by today's marker must still skip.
+        config = self._make_config(stock_list=[])
+        self._preset_full_marker(config, fingerprint_codes=["600519"])
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            return_value=["600519"],
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(fake_analysis.call_count, 0)
+                self.assertIn("启动立即执行已跳过", self._joined_logs())
+
+    def test_pure_portfolio_empty_resolution_never_skips(self):
+        # Empty portfolio resolution (no tradable positions) can never prove
+        # coverage: the gate must fail open and let the run decide, never
+        # skip on a vacuously-covered empty expected list.
+        config = self._make_config(stock_list=[])
+        self._preset_full_marker(config, fingerprint_codes=["600519"])
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            return_value=[],
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "an empty portfolio resolution must never skip the run",
+                )
+                joined = self._joined_logs()
+                self.assertIn("fail-open", joined)
+                self.assertNotIn("启动立即执行已跳过", joined)
+
+    def test_portfolio_resolution_failure_fails_open(self):
+        # A broker resolution failure must never become a skip decision
+        # ("never miss a run" outranks "never re-run"); the task must not
+        # raise either.
+        config = self._make_config(stock_list=[])
+        self._preset_full_marker(config, fingerprint_codes=["600519"])
+        with patch(
+            "main._resolve_portfolio_stock_codes",
+            side_effect=RuntimeError("futu unavailable"),
+        ):
+            with self._patched_schedule_main(
+                config, self._make_args(portfolio="futu")
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "portfolio resolution failure must fail open and run",
+                )
+                joined = self._joined_logs()
+                self.assertIn("fail-open", joined)
+                self.assertNotIn("启动立即执行已跳过", joined)
+
+    def test_process_env_stock_list_with_updated_env_file_reopens_gate(self):
+        # Scenario 3: WebUI/.env hot update after the container started with
+        # an explicit process-env STOCK_LIST. Bootstrap config keeps the
+        # process value (600519) while refresh_stock_list() at the run entry
+        # prefers the .env file (600519,000001). The gate must mirror that
+        # chain or it would skip with a stale expected list.
+        #
+        # patch.dict scope: the STOCK_LIST override only needs to cover the
+        # config bootstrap phase (explicit process override capture); the
+        # task()-phase refresh_stock_list() reads the ENV_FILE directly via
+        # dotenv_values and never consults the process env. The outer bare
+        # patch.dict(os.environ) snapshots the whole environment so side
+        # effects of setup_env()/reload helpers (e.g. DATABASE_PATH loaded
+        # from the temp .env) cannot leak into other tests.
+        self.env_path.write_text(
+            "\n".join(
+                [
+                    "STOCK_LIST=600519,000001",
+                    "DATABASE_PATH="
+                    + str(
+                        Path(self.temp_dir.name) / "data" / "stock_analysis.db"
+                    ),
+                    "SCHEDULE_ENABLED=true",
+                    "SCHEDULE_RUN_IMMEDIATELY=true",
+                    "SCHEDULE_TIME=23:59",
+                    "SCHEDULE_TIMES=",
+                    "MARKET_REVIEW_ENABLED=false",
+                    # Same baseline as the kill-switch case above: keep the
+                    # trading-day filter off so the decision is not
+                    # date-sensitive on market holidays.
+                    "TRADING_DAY_CHECK_ENABLED=false",
+                    "SCHEDULE_STARTUP_DEDUP=true",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ):
+            with patch.dict(os.environ, {"STOCK_LIST": "600519"}):
+                real_config = self._real_config_from_env()
+
+            self.assertEqual(
+                real_config.stock_list,
+                ["600519"],
+                "bootstrap config must keep the explicit process-env STOCK_LIST",
+            )
+
+            self._preset_full_marker(real_config)  # covered=["600519"]
+            with self._patched_schedule_main(
+                real_config, self._make_args()
+            ) as (task, run_immediately, fake_analysis):
+                self.assertTrue(run_immediately)
+
+                task()
+
+                self.assertEqual(
+                    fake_analysis.call_count,
+                    1,
+                    "a .env hot update adding a stock must re-open the gate",
+                )
+                self.assertEqual(
+                    real_config.stock_list,
+                    ["600519", "000001"],
+                    "the gate must hot-reload STOCK_LIST from the .env file "
+                    "like the run entry does",
+                )
+                joined = self._joined_logs()
+                self.assertIn("启动立即执行去重检查通过", joined)
+                self.assertIn("000001", joined)
+                self.assertNotIn("启动立即执行已跳过", joined)
+
 
 class AllStockTargetsSucceededUnitTestCase(unittest.TestCase):
     """Contract tests for main._all_stock_targets_succeeded (AD-A)."""
