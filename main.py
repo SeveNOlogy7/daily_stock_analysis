@@ -801,6 +801,34 @@ def _run_auto_backtest(config: Config) -> None:
         logger.warning(f"自动回测失败（已忽略）: {exc}")
 
 
+def _all_stock_targets_succeeded(
+    stock_codes: Optional[List[str]],
+    results: List[Any],
+) -> bool:
+    """Return True only when every requested stock target produced a result.
+
+    ``StockAnalysisPipeline.run`` returns just the successful results, so
+    run completeness is "every requested code shows up in the results".
+    Both sides normalize to ``str(code)`` — exactly the normalization the
+    run marker's ``stock_codes`` field uses — and order/duplicates are
+    ignored. An empty target list is a vacuous success (pure-review
+    deployments keep their same-day dedup). Market-review completeness is
+    deliberately NOT part of this check: a failing review must never
+    resurrect the restart loop the dedup gate fixes (the daily run
+    backfills it).
+    """
+    try:
+        requested = {str(code) for code in (stock_codes or [])}
+        produced = {
+            str(getattr(result, "code", "")) for result in (results or [])
+        }
+        return requested.issubset(produced)
+    except Exception:  # pragma: no cover - defensive: a bookkeeping error
+        # must never break the analysis run; not recording the marker just
+        # makes the next startup re-run (fail-open).
+        return False
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
@@ -1238,12 +1266,21 @@ def run_full_analysis(
             if deferred_failure_result is not None
             else True
         )
-        # Startup daily dedup bookkeeping: only a genuinely successful run
-        # (including the report-save check above) records the marker; skip
-        # paths and failures must not. The scope reflects the entry-level
-        # stock list; the fingerprint is computed inside the marker module
-        # from config.stock_list on both the writer and the gate side.
-        if final_result is True and not getattr(args, "dry_run", False):
+        # Startup daily dedup bookkeeping: only a genuinely successful AND
+        # complete run records the marker — every requested stock target
+        # must have produced a result (pipeline.run returns just the
+        # successes, so partial failures shrink ``results``). Skip paths,
+        # failures and partial-failure rounds must not record, otherwise a
+        # restart would wrongly dedup away the missing stocks. The scope
+        # reflects the entry-level stock list; the covered ``stock_codes``
+        # are written verbatim (str(code), same normalization as the
+        # completeness check); the stock-list fingerprint stays an
+        # observability field computed inside the marker module.
+        if (
+            final_result is True
+            and _all_stock_targets_succeeded(stock_codes, results)
+            and not getattr(args, "dry_run", False)
+        ):
             record_analysis_run_marker(
                 config,
                 scope="subset" if entry_stock_codes is not None else "full",

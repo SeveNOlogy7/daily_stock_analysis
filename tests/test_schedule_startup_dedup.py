@@ -754,6 +754,50 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
             self.assertNotIn("启动立即执行已跳过", self._joined_logs())
 
 
+class AllStockTargetsSucceededUnitTestCase(unittest.TestCase):
+    """Contract tests for main._all_stock_targets_succeeded (AD-A)."""
+
+    def _result(self, code):
+        return SimpleNamespace(code=code)
+
+    def test_empty_target_list_is_vacuous_success(self):
+        # Pure-review deployments (no stock targets) keep same-day dedup.
+        self.assertTrue(main._all_stock_targets_succeeded([], []))
+        self.assertTrue(main._all_stock_targets_succeeded(None, []))
+        self.assertTrue(
+            main._all_stock_targets_succeeded(None, [self._result("600519")])
+        )
+
+    def test_missing_target_code_fails(self):
+        results = [self._result("600519")]
+        self.assertFalse(
+            main._all_stock_targets_succeeded(["600519", "000001"], results)
+        )
+
+    def test_duplicates_and_disorder_still_succeed(self):
+        results = [self._result("000001"), self._result("600519")]
+        self.assertTrue(
+            main._all_stock_targets_succeeded(
+                ["600519", "600519", "000001"], results
+            )
+        )
+
+    def test_normalization_matches_marker_writer_str_only(self):
+        # The completeness check normalizes exactly like the marker writer
+        # (str(code) verbatim) so the covered stock_codes recorded in the
+        # marker are the codes the check actually verified.
+        self.assertTrue(
+            main._all_stock_targets_succeeded(
+                [600519], [self._result("600519")]
+            )
+        )
+        self.assertTrue(
+            main._all_stock_targets_succeeded(
+                ["600519"], [self._result(600519)]
+            )
+        )
+
+
 def _make_fake_pipeline_cls(results, report_path):
     """Build a fresh ``StockAnalysisPipeline`` stand-in (AD-D harness).
 
