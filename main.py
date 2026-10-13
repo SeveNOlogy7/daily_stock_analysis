@@ -653,6 +653,13 @@ def _resolve_gate_expected_stock_codes(
     analyze instead of a possibly stale ``config.stock_list`` snapshot
     (second-round review blockers OR-COR-e59aed48 / OR-COR-c4971c31).
 
+    The result is a snapshot taken at gate time: if the portfolio or the
+    .env watchlist changes strictly after this resolution but before the
+    run re-resolves them, the gate may miss that and a new target waits
+    for the next scheduled run. The drift direction still never skips a
+    run that would cover more than recorded (fail-open), and the residual
+    race window is a single task invocation.
+
     Returns ``(expected_codes, fail_open_reason)``:
 
     - Portfolio mode: the trading-day-filtered live position codes. An
