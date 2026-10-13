@@ -2,19 +2,31 @@
 """Daily dedup marker for the schedule-mode startup-immediate analysis run.
 
 The marker records the last successful full analysis run (date + scope +
-stock-list fingerprint) so that ``python main.py --schedule`` can skip the
-``SCHEDULE_RUN_IMMEDIATELY`` run when today's full analysis already happened
-(e.g. the container restarted later the same day). Manual/explicit paths and
-the daily scheduled invocation never consult the gate.
+the stock codes actually covered) so that ``python main.py --schedule`` can
+skip the ``SCHEDULE_RUN_IMMEDIATELY`` run when today's full analysis already
+happened AND covered everything the current startup would analyze (e.g. the
+container restarted later the same day). Manual/explicit paths and the daily
+scheduled invocation never consult the gate.
 
 Design rules (see docs/CHANGELOG.md):
 
-- Fail-open first: a missing, corrupt, unreadable or unknown-schema marker
-  always lets the run through ("never miss a run" outranks "never re-run").
-- Both the gate and the writer compute the fingerprint from
-  ``config.stock_list`` (the persisted watchlist, no network dependency);
-  the trading-day/position-filtered ``stock_codes`` are recorded for
-  observability only and never participate in the decision.
+- Fail-open first: a missing, corrupt, unreadable, unknown-schema or
+  malformed marker always lets the run through ("never miss a run"
+  outranks "never re-run").
+- Schema 2 decision = run_date is today + scope "full" + coverage: the
+  expected stock list (what this startup would analyze after the
+  trading-day filter) must be a subset of the marker's covered
+  ``stock_codes``. A morning run that only covered the CN market therefore
+  re-runs after the US market opens, while a watchlist shrink still skips.
+- The ``stock_list_fingerprint`` field is kept for observability only
+  since schema 2 and never participates in the decision; the stock codes
+  are normalized with plain ``str(code)`` on both the writer and the gate
+  (when ``--portfolio futu`` replaces the watchlist, the marker may hold
+  canonical position codes under a full scope — the gate's expected list
+  is the watchlist, so the subset check simply fails open and re-runs).
+- Schema 1 markers were written by older code that could record
+  partial-failure rounds; they are treated as unknown schema and fail
+  open once, so the next full run upgrades the marker to schema 2.
 - Market-review completeness is recorded for observability but does NOT
   gate the dedup decision: otherwise a persistently failing review would
   resurrect the very restart-loop bug this gate fixes. The daily scheduled
@@ -34,7 +46,7 @@ from typing import Any, Iterable, List, Optional
 logger = logging.getLogger(__name__)
 
 MARKER_FILE_NAME = "analysis_run_state.json"
-MARKER_SCHEMA_VERSION = 1
+MARKER_SCHEMA_VERSION = 2
 _SCOPE_FULL = "full"
 _SCOPE_SUBSET = "subset"
 
@@ -101,11 +113,19 @@ def _load_marker(marker_path: Path) -> Optional[dict]:
     return _read_marker_payload(marker_path)[0]
 
 
-def should_skip_startup_immediate_run(config: Any) -> StartupRunDecision:
+def should_skip_startup_immediate_run(
+    config: Any,
+    expected_stock_codes: Optional[Iterable[Any]] = None,
+) -> StartupRunDecision:
     """Decide whether the startup-immediate schedule run may be skipped.
 
-    Dedup key: today's local date + scope == "full" + stock-list fingerprint
-    computed from ``config.stock_list``. Any error is fail-open (execute).
+    Dedup key (schema 2): today's local date + scope == "full" + coverage —
+    ``expected_stock_codes`` (the list this startup would analyze after the
+    trading-day filter; falls back to ``config.stock_list``) must be a
+    subset of the marker's covered ``stock_codes``. The stock-list
+    fingerprint is observability only and never decides. A missing or
+    non-list ``stock_codes`` field, and any other error, is fail-open
+    (execute).
     """
     try:
         if not getattr(config, "schedule_startup_dedup", True):
@@ -156,25 +176,39 @@ def should_skip_startup_immediate_run(config: Any) -> StartupRunDecision:
                 ),
             )
 
-        marker_fingerprint = str(payload.get("stock_list_fingerprint") or "")
-        current_fingerprint = compute_stock_list_fingerprint(
-            getattr(config, "stock_list", None)
-        )
-        if marker_fingerprint != current_fingerprint:
+        covered_raw = payload.get("stock_codes")
+        if not isinstance(covered_raw, list):
             return StartupRunDecision(
                 skip=False,
                 reason=(
-                    "stock list changed: marker fingerprint "
-                    f"{marker_fingerprint} != current {current_fingerprint}"
+                    "analysis run marker stock_codes field is missing or "
+                    "not a list, fail-open"
+                ),
+            )
+        covered = {str(code) for code in covered_raw}
+
+        expected = (
+            expected_stock_codes
+            if expected_stock_codes is not None
+            else getattr(config, "stock_list", None)
+        )
+        expected_set = {str(code) for code in (expected or [])}
+        missing = expected_set - covered
+        if missing:
+            return StartupRunDecision(
+                skip=False,
+                reason=(
+                    "marker does not cover the expected stock list: missing "
+                    f"{sorted(missing)} (covered={sorted(covered)})"
                 ),
             )
 
         return StartupRunDecision(
             skip=True,
             reason=(
-                "today's full analysis already recorded "
-                f"(run_date={marker_run_date}, "
-                f"fingerprint={marker_fingerprint})"
+                "today's full analysis already recorded and covers every "
+                f"expected stock (run_date={marker_run_date}, "
+                f"covered={sorted(covered)})"
             ),
         )
     except Exception as exc:  # pragma: no cover - defensive fail-open
@@ -194,11 +228,15 @@ def record_analysis_run_marker(
     dry_run: bool = False,
     args: Any = None,
 ) -> None:
-    """Persist a run marker on a successful analysis.
+    """Persist a run marker on a successful AND complete analysis.
 
-    Writes atomically (tmp file + ``os.replace``). A subset run never
-    overwrites today's existing full marker. Any error is logged and
-    swallowed: marker bookkeeping must never break an analysis run.
+    ``stock_codes`` are the codes this run actually covered, written
+    verbatim as ``str(code)`` — the gate's coverage subset check compares
+    against exactly this normalization. The stock-list fingerprint is
+    observability only since schema 2. Writes atomically (tmp file +
+    ``os.replace``). A subset run never overwrites today's existing full
+    marker. Any error is logged and swallowed: marker bookkeeping must
+    never break an analysis run.
     """
     try:
         if args is not None and getattr(args, "dry_run", False):

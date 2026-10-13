@@ -51,7 +51,7 @@ def _marker_config(temp_dir, stock_list=("600519",), schedule_startup_dedup=True
 
 def _raw_marker_payload(**overrides):
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_date": date.today().isoformat(),
         "scope": "full",
         "stock_list_fingerprint": "a" * 16,
@@ -144,13 +144,15 @@ class AnalysisRunMarkerUnitTestCase(unittest.TestCase):
             market_review_completed=True,
         )
         payload = self._read_raw_marker()
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["run_date"], date.today().isoformat())
         self.assertEqual(payload["scope"], "full")
         self.assertEqual(
             payload["stock_list_fingerprint"],
             compute_stock_list_fingerprint(self.config.stock_list),
         )
+        # The covered stock_codes feed the schema-2 coverage gate: the
+        # recorded list must equal what this run actually analyzed.
         self.assertEqual(payload["stock_codes"], ["600519"])
         self.assertEqual(
             payload["market_review"],
@@ -162,6 +164,7 @@ class AnalysisRunMarkerUnitTestCase(unittest.TestCase):
         decision = should_skip_startup_immediate_run(self.config)
         self.assertTrue(decision.skip, decision.reason)
         self.assertIn("already recorded", decision.reason)
+        self.assertIn("covers", decision.reason)
 
     def test_record_market_review_not_requested_keeps_completed_none(self):
         self._record(market_review_requested=False, market_review_completed=None)
@@ -261,17 +264,80 @@ class AnalysisRunMarkerUnitTestCase(unittest.TestCase):
         decision = should_skip_startup_immediate_run(self.config)
         self.assertFalse(decision.skip, decision.reason)
 
-    def test_marker_fingerprint_mismatch_executes_with_reason(self):
+    def test_marker_not_covering_expected_list_executes_with_reason(self):
+        # Schema-2 semantics: the fingerprint is observability only. The
+        # gate must execute (and say why) when the marker's covered
+        # stock_codes miss any expected code — here the marker covers only
+        # 000001 while the watchlist expects 600519.
         self._write_raw_marker(
             _raw_marker_payload(
                 stock_list_fingerprint=compute_stock_list_fingerprint(
                     ["000001"]
-                )
+                ),
+                stock_codes=["000001"],
             )
         )
         decision = should_skip_startup_immediate_run(self.config)
         self.assertFalse(decision.skip, decision.reason)
-        self.assertIn("stock list changed", decision.reason)
+        self.assertIn("does not cover", decision.reason)
+        self.assertIn("600519", decision.reason)
+
+    def test_schema_v1_marker_executes_fail_open(self):
+        # Schema 1 markers may stem from partial-failure rounds recorded by
+        # the old fingerprint-only writer: they must fail open exactly once
+        # so the next full run upgrades the marker to schema 2.
+        self._write_raw_marker(
+            _raw_marker_payload(
+                schema_version=1,
+                stock_list_fingerprint=compute_stock_list_fingerprint(
+                    self.config.stock_list
+                ),
+                stock_codes=list(self.config.stock_list),
+            )
+        )
+        decision = should_skip_startup_immediate_run(self.config)
+        self.assertFalse(decision.skip, decision.reason)
+        self.assertIn("schema version", decision.reason)
+        self.assertIn("fail-open", decision.reason)
+
+    def test_marker_missing_stock_codes_field_executes_fail_open(self):
+        # A schema-2 marker without a usable stock_codes list cannot prove
+        # coverage: missing or non-array values must fail open.
+        payload = _raw_marker_payload(
+            stock_list_fingerprint=compute_stock_list_fingerprint(
+                self.config.stock_list
+            )
+        )
+        del payload["stock_codes"]
+        self._write_raw_marker(payload)
+        decision = should_skip_startup_immediate_run(self.config)
+        self.assertFalse(decision.skip, decision.reason)
+        self.assertIn("stock_codes", decision.reason)
+
+        payload = _raw_marker_payload(
+            stock_list_fingerprint=compute_stock_list_fingerprint(
+                self.config.stock_list
+            ),
+            stock_codes="600519",
+        )
+        self._write_raw_marker(payload)
+        decision = should_skip_startup_immediate_run(self.config)
+        self.assertFalse(decision.skip, decision.reason)
+        self.assertIn("stock_codes", decision.reason)
+
+    def test_covered_superset_of_expected_skips(self):
+        # Coverage is a subset check: extra covered codes (e.g. a watchlist
+        # that shrank since the morning run) must still allow the skip.
+        self._write_raw_marker(
+            _raw_marker_payload(
+                stock_list_fingerprint=compute_stock_list_fingerprint(
+                    self.config.stock_list
+                ),
+                stock_codes=["600519", "000001"],
+            )
+        )
+        decision = should_skip_startup_immediate_run(self.config)
+        self.assertTrue(decision.skip, decision.reason)
 
     def test_gate_requires_covered_superset(self):
         # Blocker OR-COR-9a7cb728: the marker's covered ``stock_codes`` being
@@ -589,6 +655,9 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
             self.assertEqual(fake_analysis.call_count, 1)
 
     def test_stock_list_change_reopens_the_gate(self):
+        # Schema-2 semantics: a marker recorded over a different watchlist
+        # (here fingerprint/codes for 000001) cannot cover the current
+        # expected list (600519), so the gate reopens with a coverage reason.
         config = self._make_config()
         self._preset_full_marker(config, fingerprint_codes=["000001"])
         with self._patched_schedule_main(
@@ -598,6 +667,7 @@ class ScheduleStartupDedupIntegrationTestCase(unittest.TestCase):
 
             self.assertEqual(fake_analysis.call_count, 1)
             self.assertIn("启动立即执行去重检查通过", self._joined_logs())
+            self.assertIn("does not cover", self._joined_logs())
 
     def test_kill_switch_env_disables_the_gate(self):
         config = self._make_config(schedule_startup_dedup=False)

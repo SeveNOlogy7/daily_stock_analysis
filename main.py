@@ -1919,7 +1919,20 @@ def main() -> int:
                     and not force_run
                     and getattr(runtime_config, "schedule_startup_dedup", True)
                 ):
-                    decision = should_skip_startup_immediate_run(runtime_config)
+                    # Expected list = what THIS startup would analyze after
+                    # the trading-day filter (schema 2 coverage gate). Only
+                    # used for the skip decision; the run below still applies
+                    # its own filter. getattr keeps minimal config stand-ins
+                    # (no stock_list attribute) on the fail-open path.
+                    expected_codes, _, _ = _compute_trading_day_filter(
+                        runtime_config,
+                        args,
+                        getattr(runtime_config, "stock_list", None) or [],
+                    )
+                    decision = should_skip_startup_immediate_run(
+                        runtime_config,
+                        expected_stock_codes=expected_codes,
+                    )
                     if decision.skip:
                         logger.info(
                             "启动立即执行已跳过:当日全量分析已完成(%s)",
