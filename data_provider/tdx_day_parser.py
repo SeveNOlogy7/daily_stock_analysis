@@ -21,12 +21,15 @@ TDX .day parser - 通达信本地日线二进制解析（纯函数模块）
 约定：
 1. 价格 ÷ 100 转元（float）；volume 保持股（int64）；amount 为元（float）。
 2. 尾部不足 32 字节的截断记录丢弃 + warning。
-3. 脏记录（date=0 / close=0 / 价格超合理上界）过滤 + warning，不影响其余行。
-4. 文件缺失返回 None（由 fetcher 层映射为空 DataFrame）。
+3. 脏记录（date=0 / date 非法日历日期 / close=0 / 价格超合理上界）过滤 + warning，
+   不影响其余行（D9）。
+4. 文件缺失返回 None（由 fetcher 层映射为空 DataFrame）；非法股票代码（剥离市场
+   前后缀后非 6 位纯数字，含路径分隔符逃逸企图）同样返回 None 走网络回退。
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
 import struct
 from pathlib import Path
@@ -83,6 +86,23 @@ def _split_market_and_code(stock_code: str) -> Tuple[str, str]:
     return market, code
 
 
+def _is_valid_yyyymmdd(date: int) -> bool:
+    """
+    判断 ``YYYYMMDD`` 整数是否为真实存在的日历日期。
+
+    另限定 1900-2100 年份窗：既挡住 20269999 这类不可能日期，也保证后续
+    ``pd.to_datetime`` 不会因越界年份（Timestamp ns 表示范围 1677-2262）抛错。
+    """
+    year, month, day = date // 10000, (date // 100) % 100, date % 100
+    if not 1900 <= year <= 2100:
+        return False
+    try:
+        datetime.date(year, month, day)
+    except ValueError:
+        return False
+    return True
+
+
 def _empty_day_frame() -> pd.DataFrame:
     """空结果 DataFrame（含全部输出列名与稳定 dtype）。"""
     return pd.DataFrame(
@@ -103,9 +123,12 @@ def parse_day_file(path) -> Optional[pd.DataFrame]:
     解析单个通达信 ``.day`` 日线文件。
 
     返回含 ``date/open/high/low/close/volume/amount`` 列的 DataFrame（按文件
-    顺序、即时间升序保持）；文件缺失/不可读返回 ``None``；空文件或全部记录
-    无效时返回空 DataFrame。
+    顺序、即时间升序保持）；路径为 ``None``（见 ``build_vipdoc_day_path``）、
+    文件缺失/不可读返回 ``None``；空文件或全部记录无效时返回空 DataFrame。
     """
+    if path is None:
+        return None
+
     file_path = Path(path)
     if not file_path.is_file():
         logger.debug("TDX .day file not found: %s", file_path)
@@ -145,6 +168,8 @@ def parse_day_file(path) -> Optional[pd.DataFrame]:
         reasons = []
         if date == 0:
             reasons.append("date=0")
+        elif not _is_valid_yyyymmdd(date):
+            reasons.append(f"date={date} not a valid calendar date")
         if c == 0:
             reasons.append("close=0")
         if max(o, h, low, c) / 100.0 > _MAX_SANE_PRICE_YUAN:
@@ -185,13 +210,21 @@ def parse_day_file(path) -> Optional[pd.DataFrame]:
     return frame[list(_OUTPUT_COLUMNS)]
 
 
-def build_vipdoc_day_path(vipdoc_root, stock_code: str) -> Path:
+def build_vipdoc_day_path(vipdoc_root, stock_code: str) -> Optional[Path]:
     """
     由 vipdoc 根目录与股票代码得到 ``<market>/lday/<market><code>.day`` 路径。
 
-    市场判定规则见 ``_split_market_and_code``；不检查文件是否存在。
+    市场判定规则见 ``_split_market_and_code``；不检查文件是否存在。股票代码
+    剥离显式市场前/后缀后必须恰为 6 位纯数字（防 ``/``、``\\`` 等分隔符逃逸
+    ``lday`` 目录，北交所 8 位码等同样拒绝）；不满足时返回 ``None``，由调用方
+    映射为空 DataFrame 走网络回退。
     """
     market, code = _split_market_and_code(stock_code)
+    if not (len(code) == 6 and code.isdigit()):
+        logger.debug(
+            "TDX vipdoc path rejected unsafe stock code %r (stripped to %r)", stock_code, code
+        )
+        return None
     return Path(vipdoc_root) / market / "lday" / f"{market}{code}.day"
 
 

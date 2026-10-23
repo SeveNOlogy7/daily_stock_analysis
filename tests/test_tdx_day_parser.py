@@ -131,6 +131,43 @@ def test_invalid_rows_filtered(tmp_path, caplog):
     assert invalid_warnings, "expected an invalid-record warning to be logged"
 
 
+def test_invalid_nonzero_date_row_dropped(tmp_path, caplog):
+    """A nonzero but impossible date (e.g. 20269999) is a dirty record: dropped
+    with a warning while the remaining rows survive (D9) -- never an uncaught
+    ValueError from pd.to_datetime."""
+    valid_1 = _pack_day_record(20260105, 1050, 1100, 1040, 1080, 100.0, 1000)
+    bad_date = _pack_day_record(20269999, 1050, 1100, 1040, 1080, 100.0, 1000)
+    valid_2 = _pack_day_record(20260108, 1050, 1100, 1040, 1080, 100.0, 1000)
+    path = _write_day_file(tmp_path, valid_1 + bad_date + valid_2)
+    with caplog.at_level(logging.WARNING, logger=_PARSER_LOGGER):
+        df = parse_day_file(path)
+    assert df is not None
+    assert list(df["date"].dt.strftime("%Y%m%d")) == ["20260105", "20260108"]
+    invalid_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "invalid" in r.getMessage().lower()
+    ]
+    assert invalid_warnings, "expected an invalid-record warning to be logged"
+
+
+def test_bare_code_rejects_non_numeric(tmp_path):
+    """A code that is not exactly 6 digits after prefix/suffix stripping returns
+    None so no path separator can escape the lday directory; the caller maps
+    None to an empty frame and falls back to the network source."""
+    root = tmp_path / "vipdoc"
+    # Forward-slash traversal attempt must not resolve inside lday
+    assert build_vipdoc_day_path(root, "6005/../../etc") is None
+    # Backslash traversal attempt (Windows-style) ditto
+    assert build_vipdoc_day_path(root, "6005\\..\\..\\etc") is None
+    # Bare numerics that are not 6 digits are rejected as well
+    assert build_vipdoc_day_path(root, "60051") is None
+    assert build_vipdoc_day_path(root, "43004711") is None
+    # Prefix style resolves only when the stripped code is 6 digits
+    assert build_vipdoc_day_path(root, "SH.600X19") is None
+    assert build_vipdoc_day_path(root, "SH600519") == root / "sh" / "lday" / "sh600519.day"
+
+
 def test_parse_day_file_missing_returns_none(tmp_path):
     assert parse_day_file(tmp_path / "does_not_exist.day") is None
 
