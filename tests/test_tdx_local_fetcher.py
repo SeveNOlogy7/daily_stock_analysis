@@ -14,6 +14,8 @@ Global test conventions (critic blocker fixes, mandatory):
   (``_daily_source_health`` is class-level state persisting across tests).
 """
 
+import logging
+import os
 import shutil
 import struct
 from datetime import date, datetime, timedelta
@@ -24,6 +26,7 @@ import pytest
 
 from data_provider.base import (
     STANDARD_COLUMNS,
+    BaseFetcher,
     DataFetcherManager,
     is_bse_code,
 )
@@ -336,3 +339,338 @@ def test_config_registry_contains_tdx_keys():
         field = get_field_definition(key)
         assert field["category"] == "data_source", f"{key} category"
         assert field["help_key"] == f"settings.data_source.{key}", f"{key} help_key"
+
+
+# === Wave 3：过期回退（D5）与对抗组（14 例） ===
+
+
+class _FakeNetworkFetcher(BaseFetcher):
+    """管理器回退测试用的网络源替身：记录调用并返回窗口末日单行数据。"""
+
+    name = "FakeNetworkFetcher"
+    priority = 1
+
+    def __init__(self, priority: int = 1):
+        super().__init__()
+        self.priority = priority
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        return pd.DataFrame(
+            [
+                {
+                    "date": pd.Timestamp(end_date),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000,
+                    "amount": 100500.0,
+                }
+            ]
+        )
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        df = df.copy()
+        df["code"] = stock_code
+        keep = ["code"] + [c for c in STANDARD_COLUMNS if c in df.columns]
+        return df[keep]
+
+
+def _consecutive_dates(end_day, count: int):
+    """以 ``end_day`` 结尾的 ``count`` 个连续日历日（最新 bar 即 end_day）。"""
+    return [end_day - timedelta(days=offset) for offset in range(count - 1, -1, -1)]
+
+
+def test_stale_local_falls_back_to_network_via_manager(tmp_path, monkeypatch):
+    """本地最新 bar 落后 end_date 15 天（> 默认 10）→ 管理器回退网络源且网络源确被调用。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    end_day = date(2026, 6, 15)
+    dates = _consecutive_dates(end_day, 15)  # 最新 bar 06-15，end 06-30，滞后 15 天
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-06-01", end_date="2026-06-30"
+    )
+
+    assert source == "FakeNetworkFetcher"
+    assert len(fake.calls) == 1
+    assert not df.empty
+
+
+def test_fresh_local_within_stale_threshold_served_locally(tmp_path, monkeypatch):
+    """最新 bar 落后 8 天（< 10，模拟长假）→ 本地源服务，不调用网络源。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    dates = _consecutive_dates(date(2026, 6, 22), 15)  # 最新 bar 06-22，end 06-30，滞后 8 天
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-06-08", end_date="2026-06-30"
+    )
+
+    assert source == "TdxLocalFetcher"
+    assert fake.calls == []
+    assert len(df) == 15
+
+
+def test_stale_boundary_exactly_10_days_served_locally(tmp_path, monkeypatch):
+    """最新 bar 落后恰 10 天 → 不回退（D5 用 > 不含等号，固化边界）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    dates = _consecutive_dates(date(2026, 6, 20), 15)  # 最新 bar 06-20，end 06-30，滞后恰 10 天
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-06-06", end_date="2026-06-30"
+    )
+
+    assert source == "TdxLocalFetcher"
+    assert fake.calls == []
+    assert len(df) == 15
+
+
+def test_stale_threshold_env_override(tmp_path, monkeypatch):
+    """TDX_LOCAL_MAX_STALE_DAYS=2 时 8 天旧的本地数据也回退网络源。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    vipdoc = tmp_path / "vipdoc"
+    (vipdoc / "sh" / "lday").mkdir(parents=True, exist_ok=True)
+    (vipdoc / "sz" / "lday").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TDX_LOCAL_PATH", str(tmp_path))
+    monkeypatch.delenv("TDX_LOCAL_PRIORITY", raising=False)
+    monkeypatch.setenv("TDX_LOCAL_MAX_STALE_DAYS", "2")
+    Config.reset_instance()
+    fetcher = TdxLocalFetcher()
+
+    dates = _consecutive_dates(date(2026, 6, 22), 15)  # 最新 bar 06-22，end 06-30，滞后 8 天
+    _write_day_file(vipdoc / "sh" / "lday" / "sh600519.day", _records_for_dates(dates))
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    _, source = manager.get_daily_data(
+        "600519", start_date="2026-06-08", end_date="2026-06-30"
+    )
+
+    assert source == "FakeNetworkFetcher"
+
+
+def test_historical_end_date_uses_end_not_today(tmp_path, monkeypatch):
+    """end_date 设为过去且本地覆盖 → 不判过期（回测场景；禁止拿今天当基准）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    # 本地数据 2026-01-01..01-30：相对"今天"已陈旧数月，但请求窗口的 end_date
+    # 是 2026-01-30 且本地覆盖 → 以 end_date 为基准，滞后 0 天，不判过期。
+    dates = _consecutive_dates(date(2026, 1, 30), 30)
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-30")
+
+    assert len(df) == 30
+
+
+def test_head_gap_returns_partial_with_warning(tmp_path, monkeypatch, caplog):
+    """请求窗口起点早于本地最早 bar → 返回窗口内已有行 + head-gap warning。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    dates = _consecutive_dates(date(2026, 1, 30), 11)  # 本地 01-20..01-30，窗口 01-01 起
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="data_provider.tdx_local_fetcher"):
+        df = fetcher.get_daily_data(
+            "600519", start_date="2026-01-01", end_date="2026-01-30"
+        )
+
+    assert len(df) == 11
+    assert df["date"].iloc[0] == pd.Timestamp("2026-01-20")
+    assert any("头部缺口" in record.getMessage() for record in caplog.records)
+
+
+def test_missing_day_file_returns_empty_not_raise(tmp_path, monkeypatch):
+    """代码无对应 .day 文件 → fetcher 空 df 不抛；管理器继续下一源。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)  # 树存在但不写任何 .day 文件
+
+    df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-30")
+    assert df.empty
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    manager_df, source = manager.get_daily_data(
+        "600519", start_date="2026-01-01", end_date="2026-01-30"
+    )
+    assert source == "FakeNetworkFetcher"
+    assert not manager_df.empty
+
+
+def test_empty_result_does_not_trip_circuit_breaker(tmp_path, monkeypatch):
+    """连续 4 次空结果后健康探针 _is_daily_source_available 仍 True（D6：空不进熔断）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)  # 树存在但无 .day 文件 → 每次空结果
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+
+    for _ in range(4):
+        df, source = manager.get_daily_data(
+            "600519", start_date="2026-01-01", end_date="2026-01-30"
+        )
+        assert source == "FakeNetworkFetcher"
+
+    # 熔断探针用 _is_daily_source_available（查 _daily_source_health，base.py:848-859），
+    # 不是 fetcher 层的 is_available_for_request（critic 修正项 3）。
+    assert DataFetcherManager._is_daily_source_available(fetcher, "cn") is True
+
+
+def test_path_is_file_not_dir_not_registered(monkeypatch, tmp_path):
+    """TDX_LOCAL_PATH 指向普通文件 → 不注册（D4 门槛 a 要求目录）。"""
+    file_path = tmp_path / "not_a_dir.txt"
+    file_path.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("TDX_LOCAL_PATH", str(file_path))
+    Config.reset_instance()
+    manager = DataFetcherManager()
+    assert "TdxLocalFetcher" not in manager.available_fetchers
+
+
+def test_unreadable_dir_returns_empty(tmp_path, monkeypatch):
+    """目录存在但无 sh/lday 结构（Windows 下模拟内容损坏）→ 空结果、回退网络源。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    bare = tmp_path / "broken_tdx"
+    bare.mkdir()  # 存在但内部无 sh/lday，resolve_vipdoc_root 应返回 None
+    monkeypatch.setenv("TDX_LOCAL_PATH", str(bare))
+    Config.reset_instance()
+    fetcher = TdxLocalFetcher()
+
+    df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-30")
+    assert df.empty
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    _, source = manager.get_daily_data(
+        "600519", start_date="2026-01-01", end_date="2026-01-30"
+    )
+    assert source == "FakeNetworkFetcher"
+
+
+def test_corrupt_records_skipped_not_fatal(tmp_path, monkeypatch):
+    """文件中段夹一条 date=0 脏记录 → 其余行正常返回（R3 fetcher 级集成）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    dates = _consecutive_dates(date(2026, 6, 5), 5)  # 06-01..06-05 共 5 条有效
+    records = _records_for_dates(dates)
+    dirty = _pack_record(0, 10.0, 10.5, 9.8, 10.3, 1000.0, 100)  # date=0 脏记录
+    corrupted = records[:2] + [dirty] + records[2:]
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        corrupted,
+    )
+
+    df = fetcher.get_daily_data("600519", start_date="2026-06-01", end_date="2026-06-05")
+
+    assert len(df) == 5
+    assert df["date"].is_monotonic_increasing
+    assert df["close"].notna().all()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="缺盘符路径语义仅在 Windows 可模拟")
+def test_nonexistent_drive_graceful(monkeypatch):
+    """TDX_LOCAL_PATH 指向不存在盘符 → 不注册/空结果，不抛 OSError 出管理器边界（R5）。"""
+    if Path("Z:/").exists():
+        pytest.skip("宿主机存在 Z: 盘，无法模拟缺失盘符")
+
+    monkeypatch.setenv("TDX_LOCAL_PATH", "Z:\\nonexistent\\vipdoc")
+    Config.reset_instance()
+    manager = DataFetcherManager()  # 注册门槛 is_dir() 为 False，不抛 OSError
+    assert "TdxLocalFetcher" not in manager.available_fetchers
+
+
+def test_start_end_days_combinations_contract(tmp_path, monkeypatch):
+    """(start,end) / (days) / (start+days) / (end only) 四组合窗口符合 base.py:467-500 契约。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    today = datetime.now().date()
+    dates = _consecutive_dates(today, 41)  # today-40..today 共 41 条
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    def returned_dates(df):
+        return [d.date() if hasattr(d, "date") else d for d in df["date"]]
+
+    def expected_window(window_start, window_end):
+        span = (window_end - window_start).days
+        return [window_end - timedelta(days=offset) for offset in range(span, -1, -1)]
+
+    # A: (start, end)
+    start_a = today - timedelta(days=20)
+    end_a = today - timedelta(days=5)
+    df = fetcher.get_daily_data(
+        "600519", start_date=start_a.isoformat(), end_date=end_a.isoformat()
+    )
+    assert returned_dates(df) == expected_window(start_a, end_a)
+
+    # B: (days=5) → end=今天、start=今天-10（days*2 日历日）
+    df = fetcher.get_daily_data("600519", days=5)
+    assert returned_dates(df) == expected_window(today - timedelta(days=10), today)
+
+    # C: (start + days) → start 已给，days 不参与默认推导，end=今天
+    start_c = today - timedelta(days=20)
+    df = fetcher.get_daily_data("600519", start_date=start_c.isoformat(), days=5)
+    assert returned_dates(df) == expected_window(start_c, today)
+
+    # D: (end only) → end 已给、start=end-days*2
+    end_d = today - timedelta(days=5)
+    df = fetcher.get_daily_data("600519", end_date=end_d.isoformat(), days=5)
+    assert returned_dates(df) == expected_window(end_d - timedelta(days=10), end_d)
+
+
+def test_non_trading_day_end_date(tmp_path, monkeypatch):
+    """end_date 为周日、本地最新 bar 为周五 → 滞后 2 天 ≤ N，不判过期（R12）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    # 2026-01-05(周一)..2026-01-09(周五) 共 5 条；end_date=2026-01-11(周日)
+    dates = _consecutive_dates(date(2026, 1, 9), 5)
+    assert dates[0] == date(2026, 1, 5)
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-11")
+
+    assert len(df) == 5
+    assert df["date"].iloc[-1] == pd.Timestamp("2026-01-09")

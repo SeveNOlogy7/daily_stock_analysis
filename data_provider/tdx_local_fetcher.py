@@ -15,7 +15,10 @@ TdxLocalFetcher - 通达信本地 vipdoc 日线数据源
    管理器跳过本源（D4 双保险之可用性探针，样板 pytdx_fetcher.py:168）。
 3. 缺文件/BSE/港股/窗口无交集一律返回空 DataFrame（D6）：空结果不进日线熔断器
    （抛异常 3 次会触发 300s 熔断），管理器记 empty 后继续下一个网络源。
-4. 代码→vipdoc 路径映射对齐 ``PytdxFetcher._get_market_code``（D8）：显式
+4. 过期回退（D5）：本地最新 bar 落后请求窗口 end_date 超过
+   ``TDX_LOCAL_MAX_STALE_DAYS``（默认 10 个日历日，覆盖国庆长假）→ 返回空结果
+   回退网络源。基准是 end_date 而非今天：回测等历史窗口且本地已覆盖时不判过期。
+5. 代码→vipdoc 路径映射对齐 ``PytdxFetcher._get_market_code``（D8）：显式
    前缀/后缀两种风格 + 裸 6 位码按 60/68→sh、其余→sz。
 """
 
@@ -113,12 +116,29 @@ class TdxLocalFetcher(BaseFetcher):
         if frame is None or frame.empty:
             return self._empty_frame()
 
-        # Wave 3（D5）预留位：过期回退判定将在窗口过滤前插入——
-        # stale = (end_date - 最新本地 bar 日期) > TDX_LOCAL_MAX_STALE_DAYS 天时返回空。
-        # 本波只做窗口过滤，不实现过期回退。
-
         start_ts = pd.Timestamp(start_date)
         end_ts = pd.Timestamp(end_date)
+
+        # D5 过期回退（Wave 3）：以请求窗口的 end_date（而非今天）为基准——回测等
+        # 历史窗口的 end_date 在过去且本地已覆盖时差值 <= 0，天然不判过期。仅当
+        # 本地最新 bar 落后 end_date 超过 TDX_LOCAL_MAX_STALE_DAYS 个日历日（默认
+        # 10，覆盖国庆长假；春节等超长假期可调大）才视为过期 → 返回空 DataFrame，
+        # 由管理器按 empty 记账并回退网络源（D6，不进日线熔断器）。
+        # 边界：恰好等于阈值（stale_days == N）不判过期，仍用本地数据。
+        latest_ts = frame["date"].max()
+        stale_days = (end_ts - latest_ts).days
+        if stale_days > self._max_stale_days:
+            logger.warning(
+                "TdxLocalFetcher 本地数据过期，回退网络源: %s, 本地最新 bar=%s, "
+                "end_date=%s, 滞后 %d 天 > TDX_LOCAL_MAX_STALE_DAYS=%d",
+                stock_code,
+                latest_ts.strftime("%Y-%m-%d"),
+                end_date,
+                stale_days,
+                self._max_stale_days,
+            )
+            return self._empty_frame()
+
         window = frame[(frame["date"] >= start_ts) & (frame["date"] <= end_ts)]
         if window.empty:
             logger.debug(
@@ -126,6 +146,17 @@ class TdxLocalFetcher(BaseFetcher):
                 stock_code,
                 start_date,
                 end_date,
+            )
+        elif window["date"].iloc[0] > start_ts:
+            # D5：历史窗口头部缺口（用户中途安装 TDX）不判失败，
+            # 返回窗口内已有行 + head-gap warning。
+            logger.warning(
+                "TdxLocalFetcher 本地数据晚于请求窗口起点（头部缺口）: %s, "
+                "窗口起点=%s, 本地最早 bar=%s, 仅返回窗口内已有 %d 行",
+                stock_code,
+                start_date,
+                window["date"].iloc[0].strftime("%Y-%m-%d"),
+                len(window),
             )
         return window
 
