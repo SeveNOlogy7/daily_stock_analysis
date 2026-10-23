@@ -1295,5 +1295,352 @@ class RealRunClosureMarkerTestCase(unittest.TestCase):
         )
 
 
+class SerialStartupDedupRegressionTestCase(unittest.TestCase):
+    """Serial regression for the startup dedup (review suggestion 2).
+
+    One true story against ONE database/marker location, told in order:
+
+    a) A REAL ``main.run_full_analysis`` run with every stock target
+       succeeding (only the ``StockAnalysisPipeline`` boundary and offline
+       collaborators patched, same harness as
+       ``RealRunClosureMarkerTestCase``) records the marker: schema v2,
+       scope=full, covered ``stock_codes`` containing every analyzed target.
+    b) A same-parameter restart (fresh config object, SAME
+       ``database_path``) in schedule mode: ``main.main()`` is driven with
+       ``src.scheduler.run_with_schedule`` patched so the ``scheduled_task``
+       callable is captured; the first invocation with ``scheduled_for=None``
+       must be skipped by the startup gate — ``run_full_analysis`` is never
+       called.
+    c) The SAME captured task invoked with a concrete ``scheduled_for`` (the
+       daily scheduled occurrence) must still execute ``run_full_analysis``:
+       daily invocations never consult the startup gate (fork at main.py
+       ``if scheduled_for is None``).
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.report_path = Path(self.temp_dir.name) / "report.md"
+        self.env_path = Path(self.temp_dir.name) / ".env"
+        self.env_path.write_text(
+            "\n".join(
+                [
+                    "STOCK_LIST=600519,000001",
+                    "SCHEDULE_ENABLED=true",
+                    "SCHEDULE_RUN_IMMEDIATELY=true",
+                    "SCHEDULE_TIME=23:59",
+                    "SCHEDULE_TIMES=",
+                    "MARKET_REVIEW_ENABLED=false",
+                    "TRADING_DAY_CHECK_ENABLED=false",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.original_cwd = os.getcwd()
+        os.chdir(self.temp_dir.name)
+        self.env_patch = patch.dict(
+            os.environ, {"ENV_FILE": str(self.env_path)}, clear=False
+        )
+        self.env_patch.start()
+        self.actions_env_patch = patch.dict(
+            os.environ, {"GITHUB_ACTIONS": "false"}, clear=False
+        )
+        self.actions_env_patch.start()
+        Config.reset_instance()
+
+        self.log_sink = []
+        root_logger = logging.getLogger()
+        self._original_root_handlers = list(root_logger.handlers)
+        self._original_root_level = root_logger.level
+        self._log_handler = _ListLogHandler(self.log_sink)
+        root_logger.addHandler(self._log_handler)
+        if root_logger.level > logging.INFO or root_logger.level == 0:
+            root_logger.setLevel(logging.INFO)
+
+    def tearDown(self):
+        root_logger = logging.getLogger()
+        current_handlers = list(root_logger.handlers)
+        for handler in current_handlers:
+            if handler not in self._original_root_handlers:
+                root_logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+        root_logger.setLevel(self._original_root_level)
+        os.chdir(self.original_cwd)
+        Config.reset_instance()
+        self.env_patch.stop()
+        self.actions_env_patch.stop()
+        self.temp_dir.cleanup()
+
+    # -- builders ---------------------------------------------------------
+
+    def _make_config(self, **overrides):
+        # Union of the two existing harness configs: the real-run harness
+        # keys (analysis path) plus the schedule-mode keys main.main()
+        # touches. One builder for both acts so the restart in act b is a
+        # literal same-parameter restart of act a's run.
+        defaults = {
+            "log_dir": self.temp_dir.name,
+            "webui_enabled": False,
+            "webui_host": "127.0.0.1",
+            "webui_port": 8000,
+            "dingtalk_stream_enabled": False,
+            "feishu_stream_enabled": False,
+            "schedule_enabled": True,
+            "schedule_time": "23:59",
+            "schedule_times": ["23:59"],
+            "schedule_run_immediately": True,
+            "run_immediately": True,
+            "agent_event_monitor_enabled": False,
+            "agent_event_alert_rules_json": "",
+            "agent_event_monitor_interval_minutes": 5,
+            "daily_market_context_enabled": False,
+            "market_review_enabled": False,
+            "market_review_region": "cn",
+            "trading_day_check_enabled": False,
+            "merge_email_notification": False,
+            "single_stock_notify": False,
+            "analysis_delay": 0,
+            "report_type": "simple",
+            "report_language": "zh",
+            "stock_list": ["600519", "000001"],
+            "database_path": str(
+                Path(self.temp_dir.name) / "data" / "stock_analysis.db"
+            ),
+            "schedule_startup_dedup": True,
+        }
+        defaults.update(overrides)
+
+        class _DummyConfig(SimpleNamespace):
+            def refresh_stock_list(self):
+                pass
+
+            def validate(self):
+                return []
+
+        return _DummyConfig(**defaults)
+
+    def _make_args(self, **overrides):
+        defaults = {
+            "debug": False,
+            "stocks": None,
+            "portfolio": "",
+            "webui": False,
+            "webui_only": False,
+            "serve": False,
+            "serve_only": False,
+            "host": None,
+            "port": None,
+            "backtest": False,
+            "market_review": False,
+            "schedule": True,
+            "no_run_immediately": False,
+            "no_notify": True,
+            "check_notify": False,
+            "no_market_review": False,
+            "dry_run": False,
+            "workers": 1,
+            "force_run": False,
+            "single_notify": False,
+            "no_context_snapshot": True,
+        }
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _analysis_result(self, code):
+        return AnalysisResult(
+            code=code,
+            name=f"stock-{code}",
+            sentiment_score=60,
+            trend_prediction="震荡",
+            operation_advice="观望",
+        )
+
+    def _run_real_full_analysis(self, *, results, config, args):
+        """REAL ``main.run_full_analysis`` with only boundary patches."""
+        fake_cls = _make_fake_pipeline_cls(results, self.report_path)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("src.core.pipeline.StockAnalysisPipeline", fake_cls)
+            )
+            stack.enter_context(
+                patch("main._refresh_stock_index_cache_for_analysis")
+            )
+            stack.enter_context(patch("main._run_auto_backtest"))
+            stack.enter_context(
+                patch(
+                    "main._prime_daily_market_context",
+                    return_value=("", ""),
+                )
+            )
+            return main.run_full_analysis(config, args)
+
+    @contextmanager
+    def _patched_schedule_main(self, config, args):
+        """Drive ``main.main()`` into schedule mode and yield the task.
+
+        Same capture pattern as
+        ``ScheduleStartupDedupIntegrationTestCase._patched_schedule_main``:
+        ``src.scheduler.run_with_schedule`` is patched out so the captured
+        ``scheduled_task`` can be invoked manually, and
+        ``main.run_full_analysis`` is the faked execution boundary whose
+        call count decides the serial-b/serial-c assertions.
+        """
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("main.parse_arguments", return_value=args)
+            )
+            stack.enter_context(
+                patch("main.get_config", return_value=config)
+            )
+            fake_run_with_schedule = stack.enter_context(
+                patch("src.scheduler.run_with_schedule")
+            )
+            fake_run_full_analysis = stack.enter_context(
+                patch("main.run_full_analysis", return_value=True)
+            )
+            exit_code = main.main()
+            self.assertEqual(
+                exit_code,
+                0,
+                "serial-b: schedule-mode main.main() must exit cleanly",
+            )
+            self.assertTrue(
+                fake_run_with_schedule.called,
+                "serial-b: run_with_schedule must be entered so the task "
+                "callable can be captured",
+            )
+            task = fake_run_with_schedule.call_args.kwargs["task"]
+            run_immediately = fake_run_with_schedule.call_args.kwargs[
+                "run_immediately"
+            ]
+            # setup_logging() replaced the root handlers inside main.main();
+            # re-attach the capture handler only now (same reason as the
+            # integration harness above).
+            root_logger = logging.getLogger()
+            root_logger.addHandler(self._log_handler)
+            try:
+                yield task, run_immediately, fake_run_full_analysis
+            finally:
+                root_logger.removeHandler(self._log_handler)
+
+    def _joined_logs(self):
+        return "\n".join(self.log_sink)
+
+    # -- the serial regression ---------------------------------------------
+
+    def test_serial_real_run_writes_marker_restart_skips_daily_still_runs(
+        self,
+    ):
+        from datetime import datetime
+
+        # -- Act a: real full run over both targets records the marker ----
+        config_a = self._make_config()
+        args = self._make_args()
+        marker_path_a = analysis_run_marker_path(config_a)
+        results = [
+            self._analysis_result("600519"),
+            self._analysis_result("000001"),
+        ]
+
+        run_ok = self._run_real_full_analysis(
+            results=results, config=config_a, args=args
+        )
+
+        self.assertTrue(
+            run_ok,
+            "serial-a: a run with every stock target succeeding must "
+            "return True",
+        )
+        self.assertTrue(
+            marker_path_a.exists(),
+            "serial-a: the successful full run must write the analysis "
+            f"run marker at {marker_path_a}",
+        )
+        payload = json.loads(marker_path_a.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["schema_version"],
+            2,
+            "serial-a: the recorded marker must be schema v2",
+        )
+        self.assertEqual(
+            payload["scope"],
+            "full",
+            "serial-a: an entry-level run without --stocks must record "
+            "scope=full",
+        )
+        self.assertEqual(
+            payload["run_date"],
+            date.today().isoformat(),
+            "serial-a: the marker must be stamped with today's run date",
+        )
+        self.assertTrue(
+            {"600519", "000001"}.issubset(set(payload["stock_codes"])),
+            "serial-a: the covered stock_codes "
+            f"{payload['stock_codes']} must contain every analyzed "
+            "target 600519/000001",
+        )
+
+        # -- Act b: same-parameter restart is deduplicated at startup -----
+        restart_config = self._make_config()
+        self.assertEqual(
+            Path(restart_config.database_path),
+            Path(config_a.database_path),
+            "serial-b: the restart must target the same database_path "
+            "(and therefore the same marker)",
+        )
+        with self._patched_schedule_main(
+            restart_config, args
+        ) as (task, run_immediately, fake_analysis):
+            self.assertTrue(
+                run_immediately,
+                "serial-b: the restart must be the startup-immediate "
+                "invocation",
+            )
+
+            task()  # scheduled_for=None: the gated startup-immediate call
+
+            self.assertEqual(
+                fake_analysis.call_count,
+                0,
+                "serial-b: the startup-immediate run must be skipped by "
+                "the dedup gate — run_full_analysis must not be called",
+            )
+            self.assertIn(
+                "启动立即执行已跳过",
+                self._joined_logs(),
+                "serial-b: the skip log semantics must be present",
+            )
+
+            # -- Act c: same captured task, daily scheduled occurrence -----
+            logs_before_daily = len(self.log_sink)
+            scheduled_for = datetime(2026, 10, 23, 23, 59)
+
+            task(scheduled_for=scheduled_for)
+
+            self.assertEqual(
+                fake_analysis.call_count,
+                1,
+                "serial-c: the daily scheduled invocation must still "
+                "execute run_full_analysis (daily runs are never "
+                "deduplicated)",
+            )
+            self.assertEqual(
+                getattr(fake_analysis.call_args.args[1], "_scheduled_for"),
+                scheduled_for,
+                "serial-c: the concrete scheduled_for occurrence must "
+                "reach the run",
+            )
+            self.assertNotIn(
+                "启动立即执行已跳过",
+                "\n".join(self.log_sink[logs_before_daily:]),
+                "serial-c: the daily scheduled invocation must not be "
+                "gated by the startup dedup (fork at "
+                "main.py `if scheduled_for is None`)",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
