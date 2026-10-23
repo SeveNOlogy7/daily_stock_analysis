@@ -358,7 +358,10 @@ class CrossAssetFetcher:
                     status="not_supported" if batch else "error",
                     name=name,
                     source="akshare:stock_zh_index_daily_em",
-                    error=None if batch else "akshare_batch_failed",
+                    # not_supported must explain itself like the yfinance
+                    # branch does (error="no_data"); only a dead batch is a
+                    # hard failure (error="akshare_batch_failed").
+                    error="no_data" if batch else "akshare_batch_failed",
                 )
                 continue
             as_of = payload.get("as_of")
