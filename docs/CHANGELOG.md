@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Telegram 推送按 UTF-16 长度判断与分段，修复含大量 emoji 的报告超出 4096 限制导致发送失败的问题。
 
+- [新功能] 个股分析新增跨资产上下文（cross-asset-v1）：注入“外围环境与跨资产”低敏摘要到普通分析与 Agent prompt，RiskAgent reasoning 须回答外部环境是否支持结论；risk-off 时对高置信激进买入做置信度校准（不改决策类型），支持开关 `CROSS_ASSET_CONTEXT_ENABLED` 与四级 fail-open 降级（#1910）。
+
 ## [3.33.0] - 2026-10-15
 
 ### 发布亮点
