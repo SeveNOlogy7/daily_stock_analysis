@@ -104,7 +104,7 @@ def _make_tdx_tree(tmp_path: Path, style: str = "install") -> Path:
     return root
 
 
-def _make_fetcher(tmp_path: Path, monkeypatch) -> "TdxLocalFetcher":
+def _make_fetcher(tmp_path: Path, monkeypatch) -> BaseFetcher:
     """Construct a TdxLocalFetcher bound to a synthetic vipdoc tree.
 
     Layout: TDX_LOCAL_PATH points at ``tmp_path`` (install-root style) whose
@@ -385,8 +385,6 @@ def _consecutive_dates(end_day, count: int):
 
 def test_stale_local_falls_back_to_network_via_manager(tmp_path, monkeypatch):
     """本地最新 bar 落后 end_date 15 天（> 默认 10）→ 管理器回退网络源且网络源确被调用。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     end_day = date(2026, 6, 15)
     dates = _consecutive_dates(end_day, 15)  # 最新 bar 06-15，end 06-30，滞后 15 天
@@ -408,8 +406,6 @@ def test_stale_local_falls_back_to_network_via_manager(tmp_path, monkeypatch):
 
 def test_fresh_local_within_stale_threshold_served_locally(tmp_path, monkeypatch):
     """最新 bar 落后 8 天（< 10，模拟长假）→ 本地源服务，不调用网络源。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     dates = _consecutive_dates(date(2026, 6, 22), 15)  # 最新 bar 06-22，end 06-30，滞后 8 天
     _write_day_file(
@@ -430,8 +426,6 @@ def test_fresh_local_within_stale_threshold_served_locally(tmp_path, monkeypatch
 
 def test_stale_boundary_exactly_10_days_served_locally(tmp_path, monkeypatch):
     """最新 bar 落后恰 10 天 → 不回退（D5 用 > 不含等号，固化边界）。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     dates = _consecutive_dates(date(2026, 6, 20), 15)  # 最新 bar 06-20，end 06-30，滞后恰 10 天
     _write_day_file(
@@ -477,8 +471,6 @@ def test_stale_threshold_env_override(tmp_path, monkeypatch):
 
 def test_historical_end_date_uses_end_not_today(tmp_path, monkeypatch):
     """end_date 设为过去且本地覆盖 → 不判过期（回测场景；禁止拿今天当基准）。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     # 本地数据 2026-01-01..01-30：相对"今天"已陈旧数月，但请求窗口的 end_date
     # 是 2026-01-30 且本地覆盖 → 以 end_date 为基准，滞后 0 天，不判过期。
@@ -495,8 +487,6 @@ def test_historical_end_date_uses_end_not_today(tmp_path, monkeypatch):
 
 def test_head_gap_returns_partial_with_warning(tmp_path, monkeypatch, caplog):
     """请求窗口起点早于本地最早 bar → 返回窗口内已有行 + head-gap warning。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     dates = _consecutive_dates(date(2026, 1, 30), 11)  # 本地 01-20..01-30，窗口 01-01 起
     _write_day_file(
@@ -516,8 +506,6 @@ def test_head_gap_returns_partial_with_warning(tmp_path, monkeypatch, caplog):
 
 def test_missing_day_file_returns_empty_not_raise(tmp_path, monkeypatch):
     """代码无对应 .day 文件 → fetcher 空 df 不抛；管理器继续下一源。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)  # 树存在但不写任何 .day 文件
 
     df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-30")
@@ -534,8 +522,6 @@ def test_missing_day_file_returns_empty_not_raise(tmp_path, monkeypatch):
 
 def test_empty_result_does_not_trip_circuit_breaker(tmp_path, monkeypatch):
     """连续 4 次空结果后健康探针 _is_daily_source_available 仍 True（D6：空不进熔断）。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)  # 树存在但无 .day 文件 → 每次空结果
     fake = _FakeNetworkFetcher(priority=1)
     manager = DataFetcherManager([fetcher, fake])
@@ -584,8 +570,6 @@ def test_unreadable_dir_returns_empty(tmp_path, monkeypatch):
 
 def test_corrupt_records_skipped_not_fatal(tmp_path, monkeypatch):
     """文件中段夹一条 date=0 脏记录 → 其余行正常返回（R3 fetcher 级集成）。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     dates = _consecutive_dates(date(2026, 6, 5), 5)  # 06-01..06-05 共 5 条有效
     records = _records_for_dates(dates)
@@ -617,8 +601,6 @@ def test_nonexistent_drive_graceful(monkeypatch):
 
 def test_start_end_days_combinations_contract(tmp_path, monkeypatch):
     """(start,end) / (days) / (start+days) / (end only) 四组合窗口符合 base.py:467-500 契约。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     today = datetime.now().date()
     dates = _consecutive_dates(today, 41)  # today-40..today 共 41 条
@@ -659,8 +641,6 @@ def test_start_end_days_combinations_contract(tmp_path, monkeypatch):
 
 def test_non_trading_day_end_date(tmp_path, monkeypatch):
     """end_date 为周日、本地最新 bar 为周五 → 滞后 2 天 ≤ N，不判过期（R12）。"""
-    from data_provider.tdx_local_fetcher import TdxLocalFetcher
-
     fetcher = _make_fetcher(tmp_path, monkeypatch)
     # 2026-01-05(周一)..2026-01-09(周五) 共 5 条；end_date=2026-01-11(周日)
     dates = _consecutive_dates(date(2026, 1, 9), 5)
