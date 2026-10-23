@@ -80,7 +80,13 @@ def format_cross_asset_context_prompt_section(
     trade_date = str(payload.get("trade_date") or "").strip()
     market = str(payload.get("market") or "cn").strip().lower()
     impact_summary = _escape_sentinels(str(payload.get("impact_summary") or "").strip())
-    risk_tags = _clean_list(payload.get("risk_tags"))
+    risk_tags = [_escape_sentinels(tag) for tag in _clean_list(payload.get("risk_tags"))]
+
+    if not _block_has_content(payload, risk_tags):
+        # Nothing renderable inside the UNTRUSTED block (e.g. a client-supplied
+        # dict whose every numeric field is malformed): render no section at
+        # all, matching the daily mirror's garbage-input -> "" behaviour.
+        return ""
 
     if language in ("en", "ko"):
         return _render_en(payload, language, risk_appetite, market, trade_date, impact_summary, risk_tags)
@@ -187,23 +193,26 @@ def _asset_summary_lines(
 
 
 def _format_item(key: str, item: Mapping[str, Any], *, zh: bool) -> str:
+    # Numeric fields are untrusted: chat clients can hand raw dicts through
+    # ``context`` (resolve_stock_scope passes them through verbatim), so a
+    # malformed value/change_pct must skip the item instead of raising
+    # TypeError/ValueError (bool is an int subclass and is rejected too).
     value = item.get("value")
-    if value is None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return ""
-    label = str(item.get("name") or "").strip() or str(key)
+    change_pct = item.get("change_pct")
+    if change_pct is not None and (
+        isinstance(change_pct, bool) or not isinstance(change_pct, (int, float))
+    ):
+        return ""
+    label = _escape_sentinels(str(item.get("name") or "").strip() or str(key))
     if abs(value) >= 1000:
         value_text = f"{value:,.0f}"
     else:
         value_text = f"{value:,.2f}"
-    change_pct = item.get("change_pct")
-    change = ""
-    if change_pct is not None:
-        change = f"({change_pct:+.2f}%)"
+    change = "" if change_pct is None else f"({change_pct:+.2f}%)"
     stale = bool(item.get("stale"))
     stale_mark = "*" if stale else ""
-    error = str(item.get("error") or "").strip()
-    if error and value is None:
-        return ""
     suffix = ""
     if stale and zh:
         suffix = "[滞后]"
@@ -215,6 +224,16 @@ def _format_item(key: str, item: Mapping[str, Any], *, zh: bool) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _block_has_content(payload: Mapping[str, Any], risk_tags: List[str]) -> bool:
+    """True when at least one line would survive inside the UNTRUSTED block."""
+
+    if str(payload.get("impact_summary") or "").strip():
+        return True
+    if risk_tags:
+        return True
+    return bool(_asset_summary_lines(payload, _GROUP_LABELS_ZH, zh=True))
+
+
 def _coerce_context_mapping(context: Any) -> Dict[str, Any]:
     if context is None:
         return {}

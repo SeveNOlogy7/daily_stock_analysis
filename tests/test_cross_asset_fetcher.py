@@ -18,6 +18,10 @@ Plus the FX cache-first contract (portfolio cache hit / stale / miss / broken).
 
 from __future__ import annotations
 
+import itertools
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
@@ -352,3 +356,86 @@ class TestFxCacheFirst:
 
         assert snapshot["fx"]["USDCNH"].status == "ok"
         assert snapshot["fx"]["USDCNH"].source == "yfinance"
+
+
+class TestDollarIndexKey:
+    """The dollar-index self-pair ("DXY","DXY") must surface under the key
+    "DXY", not "DXYDXY" (issue #1910 review, minor)."""
+
+    def test_us_fx_group_uses_explicit_dxy_key(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock())
+        with _patch_yf({
+            "DX-Y.NYB": (FRESH_AS_OF, 105.2, 104.9),
+            "USDCNH=X": (FRESH_AS_OF, 7.31, 7.28),
+        }):
+            snapshot = fetcher.fetch_market_snapshot("us", TRADE_DATE)
+
+        assert set(snapshot["fx"].keys()) == {"USDCNH", "DXY"}
+        assert snapshot["fx"]["DXY"].status == "ok"
+        assert snapshot["fx"]["DXY"].value == pytest.approx(105.2)
+        assert snapshot["fx"]["DXY"].name == "美元指数"
+        _assert_quadruple(snapshot["fx"]["DXY"])
+
+    def test_hk_fx_group_and_timeout_names_use_dxy_key(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock())
+        with _patch_yf({"DX-Y.NYB": (FRESH_AS_OF, 105.2, 104.9)}):
+            snapshot = fetcher.fetch_market_snapshot("hk", TRADE_DATE)
+        assert "DXY" in snapshot["fx"]
+        assert "DXYDXY" not in snapshot["fx"]
+
+        # the budget-exceeded path builds its placeholder names via the same
+        # key rule
+        timeout_group = fetcher._timeout_group_items("hk", "fx", TRADE_DATE)
+        assert "DXY" in timeout_group
+        assert "DXYDXY" not in timeout_group
+        assert timeout_group["DXY"].error == "timeout"
+
+
+class TestBudgetDeadlineIsolation:
+    """The budget deadline must be call-stack local, not instance state: the
+    fetcher is a shared singleton and task_queue runs analyze_stock on a
+    ThreadPoolExecutor, so an instance attribute would let concurrent fetches
+    overwrite each other's deadline (issue #1910 review, minor)."""
+
+    def test_deadline_is_not_instance_state_and_helpers_take_it_explicitly(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock(), timeout_seconds=8)
+        assert not hasattr(fetcher, "_deadline")
+        # helpers are dead-reckoned from an explicit deadline (old no-arg
+        # signature raised TypeError here)
+        assert fetcher._budget_exceeded(time.monotonic() - 1) is True
+        assert fetcher._budget_exceeded(time.monotonic() + 60) is False
+        assert fetcher._budget_remaining(time.monotonic() + 60) > 0
+
+    def test_concurrent_fetches_on_shared_instance_complete_isolated(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock(), timeout_seconds=8)
+        counter = itertools.count()
+        counter_lock = threading.Lock()
+        first_parked = threading.Event()
+        release_first = threading.Event()
+
+        def _seam(symbol: str):
+            with counter_lock:
+                n = next(counter)
+            if n == 0:
+                # park the first fetch mid-group so the second overlaps it
+                first_parked.set()
+                release_first.wait(timeout=5)
+            return (FRESH_AS_OF, 100.0, 99.0)
+
+        with patch.object(
+            CrossAssetFetcher, "_fetch_yf_series", new=staticmethod(_seam)
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(fetcher.fetch_market_snapshot, "us", TRADE_DATE)
+                assert first_parked.wait(timeout=5)
+                fut_b = pool.submit(fetcher.fetch_market_snapshot, "us", TRADE_DATE)
+                snapshot_b = fut_b.result(timeout=15)  # must not block on A
+                release_first.set()
+                snapshot_a = fut_a.result(timeout=15)
+
+        for snapshot in (snapshot_a, snapshot_b):
+            assert set(snapshot.keys()) == set(CROSS_ASSET_GROUPS)
+            assert snapshot["volatility"]["VIX"].status == "ok"
+            for group in CROSS_ASSET_GROUPS:
+                for item in snapshot[group].values():
+                    _assert_quadruple(item)

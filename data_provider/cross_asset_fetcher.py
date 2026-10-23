@@ -174,6 +174,16 @@ def _change_pct(last: float, prev: float) -> Optional[float]:
     return round((last - prev) / prev * 100.0, 2)
 
 
+def _fx_pair_key(from_ccy: str, to_ccy: str) -> str:
+    """Stable snapshot key for an FX pair.
+
+    Self-pairs such as the dollar index ("DXY", "DXY") collapse to "DXY"
+    instead of the meaningless "DXYDXY".
+    """
+
+    return "DXY" if from_ccy == to_ccy else f"{from_ccy}{to_ccy}"
+
+
 class CrossAssetFetcher:
     """Never-raising cross-asset snapshot reader with a cooperative budget."""
 
@@ -193,7 +203,6 @@ class CrossAssetFetcher:
         except (TypeError, ValueError):
             self._stale_days = 2
         self._fx_repo = fx_repo
-        self._deadline: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -213,17 +222,21 @@ class CrossAssetFetcher:
             normalized = "cn"
         if not isinstance(trade_date, date):
             trade_date = date.today()
-        self._deadline = time.monotonic() + self._timeout_seconds
+        # The budget deadline is a call-stack local (NOT instance state): the
+        # fetcher is a shared singleton and task_queue runs analyze_stock on a
+        # ThreadPoolExecutor, so an instance attribute would let concurrent
+        # fetches overwrite each other's deadline.
+        deadline = time.monotonic() + self._timeout_seconds
 
         snapshot: Dict[str, Dict[str, CrossAssetItem]] = {
             group: {} for group in CROSS_ASSET_GROUPS
         }
         for group in _FETCH_ORDER:
-            if self._budget_exceeded():
+            if self._budget_exceeded(deadline):
                 snapshot[group] = self._timeout_group_items(normalized, group, trade_date)
                 continue
             try:
-                snapshot[group] = self._fetch_group(normalized, group, trade_date)
+                snapshot[group] = self._fetch_group(normalized, group, trade_date, deadline)
             except Exception as exc:  # defensive: group-level backstop
                 logger.warning("[CrossAssetFetcher] %s 组抓取异常: %s", group, exc)
                 snapshot[group] = {
@@ -243,31 +256,35 @@ class CrossAssetFetcher:
         market: str,
         group: str,
         trade_date: date,
+        deadline: float,
     ) -> Dict[str, CrossAssetItem]:
         if group == "indices":
-            return self._fetch_indices(market, trade_date)
+            return self._fetch_indices(market, trade_date, deadline)
         if group == "fx":
-            return self._fetch_fx(market, trade_date)
+            return self._fetch_fx(market, trade_date, deadline)
         if group == "volatility":
-            return self._fetch_symbol_group(market, "volatility", trade_date)
+            return self._fetch_symbol_group(market, "volatility", trade_date, deadline)
         if group == "rates":
-            return self._fetch_symbol_group(market, "rates", trade_date)
+            return self._fetch_symbol_group(market, "rates", trade_date, deadline)
         if group == "commodities":
-            return self._fetch_symbol_group(market, "commodities", trade_date)
+            return self._fetch_symbol_group(market, "commodities", trade_date, deadline)
         if group == "crypto":
-            return self._fetch_symbol_group(market, "crypto", trade_date)
+            return self._fetch_symbol_group(market, "crypto", trade_date, deadline)
         return {}
 
-    def _fetch_indices(self, market: str, trade_date: date) -> Dict[str, CrossAssetItem]:
+    def _fetch_indices(
+        self, market: str, trade_date: date, deadline: float
+    ) -> Dict[str, CrossAssetItem]:
         items: Dict[str, CrossAssetItem] = {}
         if market == "cn":
-            items.update(self._fetch_cn_akshare_indices(trade_date))
+            items.update(self._fetch_cn_akshare_indices(trade_date, deadline))
             items.update(
                 self._fetch_symbol_table(
                     _CN_YF_BEST_EFFORT_INDICES,
                     trade_date,
                     stale_days=_INDEX_STALE_THRESHOLD_DAYS,
                     source="yfinance",
+                    deadline=deadline,
                 )
             )
         else:
@@ -278,6 +295,7 @@ class CrossAssetFetcher:
                     trade_date,
                     stale_days=_INDEX_STALE_THRESHOLD_DAYS,
                     source="yfinance",
+                    deadline=deadline,
                 )
             )
         return items
@@ -287,6 +305,7 @@ class CrossAssetFetcher:
         market: str,
         group: str,
         trade_date: date,
+        deadline: float,
     ) -> Dict[str, CrossAssetItem]:
         table = _GLOBAL_SYMBOLS.get(group, {})
         # rates (US 10Y) uses the strict trading-day+1 threshold;
@@ -297,6 +316,7 @@ class CrossAssetFetcher:
             trade_date,
             stale_days=stale_days,
             source="yfinance",
+            deadline=deadline,
         )
 
     def _fetch_symbol_table(
@@ -306,6 +326,7 @@ class CrossAssetFetcher:
         *,
         stale_days: int,
         source: str,
+        deadline: float,
     ) -> Dict[str, CrossAssetItem]:
         items: Dict[str, CrossAssetItem] = {}
         for key, (symbol, name) in list(table.items())[:_YF_MAX_SYMBOLS_PER_GROUP]:
@@ -316,22 +337,25 @@ class CrossAssetFetcher:
                 trade_date=trade_date,
                 stale_days=stale_days,
                 source=source,
+                deadline=deadline,
             )
         return items
 
     # ------------------------------------------------------------------
     # A-share indices (akshare, one bounded batch subprocess)
     # ------------------------------------------------------------------
-    def _fetch_cn_akshare_indices(self, trade_date: date) -> Dict[str, CrossAssetItem]:
+    def _fetch_cn_akshare_indices(
+        self, trade_date: date, deadline: float
+    ) -> Dict[str, CrossAssetItem]:
         items: Dict[str, CrossAssetItem] = {}
-        if self._budget_exceeded():
+        if self._budget_exceeded(deadline):
             return {
                 key: self._timeout_item(name=name, trade_date=trade_date)
                 for key, name in _CN_AKSHARE_INDICES.items()
             }
         start = (trade_date - timedelta(days=10)).strftime("%Y%m%d")
         end = (trade_date + timedelta(days=1)).strftime("%Y%m%d")
-        remaining = self._budget_remaining()
+        remaining = self._budget_remaining(deadline)
         batch_timeout = min(
             max(remaining, _MIN_AKSHARE_BATCH_TIMEOUT_SECONDS),
             _MAX_AKSHARE_BATCH_TIMEOUT_SECONDS,
@@ -382,10 +406,12 @@ class CrossAssetFetcher:
     # ------------------------------------------------------------------
     # FX (portfolio cache first, yfinance fallback)
     # ------------------------------------------------------------------
-    def _fetch_fx(self, market: str, trade_date: date) -> Dict[str, CrossAssetItem]:
+    def _fetch_fx(
+        self, market: str, trade_date: date, deadline: float
+    ) -> Dict[str, CrossAssetItem]:
         items: Dict[str, CrossAssetItem] = {}
         for from_ccy, to_ccy, symbol, name in _FX_PAIRS.get(market, ()):
-            key = f"{from_ccy}{to_ccy}"
+            key = _fx_pair_key(from_ccy, to_ccy)
             items[key] = self._safe_fx_item(
                 key=key,
                 name=name,
@@ -393,6 +419,7 @@ class CrossAssetFetcher:
                 to_ccy=to_ccy,
                 symbol=symbol,
                 trade_date=trade_date,
+                deadline=deadline,
             )
         return items
 
@@ -405,6 +432,7 @@ class CrossAssetFetcher:
         to_ccy: str,
         symbol: str,
         trade_date: date,
+        deadline: float,
     ) -> CrossAssetItem:
         cached = self._read_fx_cache(from_ccy=from_ccy, to_ccy=to_ccy, as_of=trade_date)
         if cached is not None:
@@ -426,6 +454,7 @@ class CrossAssetFetcher:
             trade_date=trade_date,
             stale_days=self._stale_days,
             source="yfinance",
+            deadline=deadline,
         )
 
     def _read_fx_cache(
@@ -485,8 +514,9 @@ class CrossAssetFetcher:
         trade_date: date,
         stale_days: int,
         source: str,
+        deadline: float,
     ) -> CrossAssetItem:
-        if self._budget_exceeded():
+        if self._budget_exceeded(deadline):
             return self._timeout_item(name=name, trade_date=trade_date)
         try:
             series = self._fetch_yf_series(symbol)
@@ -537,11 +567,11 @@ class CrossAssetFetcher:
     # ------------------------------------------------------------------
     # Budget / quality helpers
     # ------------------------------------------------------------------
-    def _budget_remaining(self) -> float:
-        return self._deadline - time.monotonic()
+    def _budget_remaining(self, deadline: float) -> float:
+        return deadline - time.monotonic()
 
-    def _budget_exceeded(self) -> bool:
-        return self._budget_remaining() <= 0
+    def _budget_exceeded(self, deadline: float) -> bool:
+        return self._budget_remaining(deadline) <= 0
 
     def _is_stale(self, as_of: Optional[date], trade_date: date, threshold_days: int) -> bool:
         if as_of is None:
@@ -583,7 +613,7 @@ class CrossAssetFetcher:
             return {key: self._timeout_item(name=name, trade_date=trade_date) for key, name in names.items()}
         if group == "fx":
             names = {
-                f"{from_ccy}{to_ccy}": name
+                _fx_pair_key(from_ccy, to_ccy): name
                 for from_ccy, to_ccy, _symbol, name in _FX_PAIRS.get(market, ())
             }
             return {key: self._timeout_item(name=name, trade_date=trade_date) for key, name in names.items()}
