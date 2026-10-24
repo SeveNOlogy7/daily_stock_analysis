@@ -509,6 +509,63 @@ def test_stale_threshold_env_override(tmp_path, monkeypatch):
     assert source == "FakeNetworkFetcher"
 
 
+def test_zero_stale_threshold_rejects_stale_local(tmp_path, monkeypatch):
+    """TDX_LOCAL_MAX_STALE_DAYS=0（config/registry 均允许的合法值）不被替换为默认 10：滞后 3 天即回退。
+
+    OpenReview OR-COR-81538099 回归：旧实现 `配置值 or _DEFAULT_MAX_STALE_DAYS`
+    把 0 静默替换为 10，用户要求的"零容忍滞后"失效。
+    """
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    vipdoc = tmp_path / "vipdoc"
+    (vipdoc / "sh" / "lday").mkdir(parents=True, exist_ok=True)
+    (vipdoc / "sz" / "lday").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TDX_LOCAL_PATH", str(tmp_path))
+    monkeypatch.delenv("TDX_LOCAL_PRIORITY", raising=False)
+    monkeypatch.setenv("TDX_LOCAL_MAX_STALE_DAYS", "0")
+    Config.reset_instance()
+    fetcher = TdxLocalFetcher()
+    assert fetcher._max_stale_days == 0  # 合法阈值 0 被保留
+
+    dates = _consecutive_dates(date(2026, 6, 27), 15)  # 最新 bar 06-27，end 06-30，滞后 3 天
+    _write_day_file(vipdoc / "sh" / "lday" / "sh600519.day", _records_for_dates(dates))
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    _, source = manager.get_daily_data(
+        "600519", start_date="2026-06-13", end_date="2026-06-30"
+    )
+
+    assert source == "FakeNetworkFetcher"
+
+
+def test_zero_stale_threshold_still_serves_fresh_local(tmp_path, monkeypatch):
+    """阈值 0 时滞后恰 0 天（最新 bar == end_date）仍用本地数据（边界语义不变）。"""
+    from data_provider.tdx_local_fetcher import TdxLocalFetcher
+
+    vipdoc = tmp_path / "vipdoc"
+    (vipdoc / "sh" / "lday").mkdir(parents=True, exist_ok=True)
+    (vipdoc / "sz" / "lday").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TDX_LOCAL_PATH", str(tmp_path))
+    monkeypatch.delenv("TDX_LOCAL_PRIORITY", raising=False)
+    monkeypatch.setenv("TDX_LOCAL_MAX_STALE_DAYS", "0")
+    Config.reset_instance()
+    fetcher = TdxLocalFetcher()
+
+    dates = _consecutive_dates(date(2026, 6, 30), 15)  # 最新 bar == end 06-30，滞后 0 天
+    _write_day_file(vipdoc / "sh" / "lday" / "sh600519.day", _records_for_dates(dates))
+
+    fake = _FakeNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-06-16", end_date="2026-06-30"
+    )
+
+    assert source == "TdxLocalFetcher"
+    assert fake.calls == []
+    assert len(df) == 15
+
+
 def test_historical_end_date_uses_end_not_today(tmp_path, monkeypatch):
     """end_date 设为过去且本地覆盖 → 不判过期（回测场景；禁止拿今天当基准）。"""
     fetcher = _make_fetcher(tmp_path, monkeypatch)

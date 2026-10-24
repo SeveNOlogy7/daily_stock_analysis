@@ -77,9 +77,11 @@ class TdxLocalFetcher(BaseFetcher):
         raw_path = str(getattr(config, "tdx_local_path", None) or "").strip()
         self._tdx_root: Optional[Path] = Path(raw_path) if raw_path else None
         self.priority = int(getattr(config, "tdx_local_priority", 0) or 0)
-        self._max_stale_days = int(
-            getattr(config, "tdx_local_max_stale_days", _DEFAULT_MAX_STALE_DAYS)
-            or _DEFAULT_MAX_STALE_DAYS
+        # 合法阈值 0（config.py/config_registry.py 均允许，语义=零容忍滞后）不得被
+        # `or` 静默替换为默认 10——仅未配置（None）时才取默认值。
+        raw_stale_days = getattr(config, "tdx_local_max_stale_days", None)
+        self._max_stale_days = (
+            int(raw_stale_days) if raw_stale_days is not None else _DEFAULT_MAX_STALE_DAYS
         )
 
     def _resolve_vipdoc_root(self) -> Optional[Path]:
