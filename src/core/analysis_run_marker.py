@@ -27,7 +27,8 @@ Design rules (see docs/CHANGELOG.md):
   are normalized with plain ``str(code)`` on both the writer and the gate
   (when ``--portfolio futu`` replaces the watchlist, the marker may hold
   canonical position codes under a full scope — the gate's expected list
-  is the watchlist, so the subset check simply fails open and re-runs).
+  resolves through the same live-portfolio chain, so the subset check
+  still matches and skips).
 - Schema 1 markers were written by older code that could record
   partial-failure rounds; they are treated as unknown schema and fail
   open once, so the next full run upgrades the marker to schema 2.
