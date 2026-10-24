@@ -334,6 +334,39 @@ class HistoryDailyApiTestCase(unittest.TestCase):
         self.assertEqual(by_id[zero_id]["sentiment_score"], 0)
         self.assertEqual(by_id[zero_id]["sentiment_label"], "极度悲观")
 
+    def test_13_hk_code_variants_merge_to_one_row(self) -> None:
+        """同日 00700/HK00700/00700.HK → canonical hk00700 归组，total=1（评审 OR-COR-f3050c49）。"""
+        bare_id = self._add_history("00700", D1, name="腾讯控股")
+        hk_id = self._add_history("HK00700", D1, name="腾讯控股HK")
+        suffix_id = self._add_history("00700.HK", D1_LATER, name="腾讯控股.HK")
+        winner = max(bare_id, hk_id, suffix_id)
+
+        resp = self._get_daily()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        payload = resp.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["id"], winner)
+        self.assertTrue(item["is_latest"])
+
+    def test_14_hk_variant_update_supersedes_older_record(self) -> None:
+        """前日 00700 记录在次日以 HK00700 保存新分析后 is_latest=False。"""
+        day1_id = self._add_history("00700", D1)
+        day2_id = self._add_history("HK00700", D2)
+
+        resp_day1 = self._get_daily()
+        self.assertEqual(resp_day1.status_code, 200, resp_day1.text)
+        item_day1 = resp_day1.json()["items"][0]
+        self.assertEqual(item_day1["id"], day1_id)
+        self.assertFalse(item_day1["is_latest"])
+
+        resp_day2 = self._get_daily(date="2026-10-21")
+        self.assertEqual(resp_day2.status_code, 200, resp_day2.text)
+        item_day2 = resp_day2.json()["items"][0]
+        self.assertEqual(item_day2["id"], day2_id)
+        self.assertTrue(item_day2["is_latest"])
+
 
 if __name__ == "__main__":
     unittest.main()

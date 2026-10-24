@@ -409,24 +409,32 @@ class HistoryService:
     def _daily_group_key(raw_code: Any, display_code: str) -> str:
         """Build the daily-history grouping key from the *persisted* code.
 
-        Mirrors ``_stock_bar_group_key`` in ``api/v1/endpoints/history.py``
-        (imported there from the endpoint layer to avoid a service→API
-        dependency): registered indices group by the parser canonical, stocks
-        keep the legacy display-based normalization so ``002460`` and
-        ``002460.SZ`` converge to one row (issue #1661).
+        All asset types group by the parser canonical id so every persisted
+        code variant of one instrument converges on a single daily row:
+        ``00700`` / ``HK00700`` / ``00700.HK`` all canonicalize to
+        ``hk00700`` (issue #1661 review OR-COR-f3050c49), A-share variants
+        ``002460`` / ``002460.SZ`` to ``sz002460``, and registered indices
+        keep the PR #2312 semantics (``sh000016`` / ``csi930955``). Falls
+        back to the legacy display-based normalization only when the parser
+        fails or yields an empty canonical.
+
+        Note: this intentionally diverges from ``_stock_bar_group_key`` in
+        ``api/v1/endpoints/history.py`` (which keeps legacy display
+        normalization for stocks) — the daily per-date view must not split
+        HK variants into duplicate rows or mis-mark superseded records as
+        latest.
         """
         from data_provider.base import normalize_stock_code
-        from src.services.stock_list_parser import ParseStatus, parse_analysis_target
+        from src.services.stock_list_parser import parse_analysis_target
 
         code = str(raw_code or "").strip()
-        if not code:
-            return normalize_stock_code(display_code or "")
-        try:
-            target = parse_analysis_target(code)
-        except Exception:
-            return normalize_stock_code(display_code or "")
-        if target.asset_type == ParseStatus.INDEX:
-            return target.canonical_id
+        if code:
+            try:
+                target = parse_analysis_target(code)
+            except Exception:
+                target = None
+            if target is not None and target.canonical_id:
+                return target.canonical_id
         return normalize_stock_code(display_code or "")
 
     def get_daily_history(
