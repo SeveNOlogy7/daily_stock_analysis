@@ -24,11 +24,10 @@ patching every legacy SimpleNamespace/MagicMock stub in the suite.
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from api.v1.endpoints.analysis import (
     _attach_cross_asset_summary_to_report_meta,
@@ -611,6 +610,156 @@ class TestAgentPath:
         message = agent.build_user_message(ctx)
 
         assert "外围环境与跨资产" not in message
+
+
+# ---------------------------------------------------------------------------
+# OR-COR-f88926c2 — standard/quick multi-agent chains carry the summary
+# ---------------------------------------------------------------------------
+class TestMultiAgentMessageInjection:
+    """The cross-asset summary must reach EVERY mode's agent chain through the
+    real execution path (real agents, fake LLM loop): quick=technical→decision
+    and standard=technical→intel→decision contain no RiskAgent, so before the
+    BaseAgent injection those modes analyzed with zero external context while
+    the post-processing still applied the risk-off confidence guardrail."""
+
+    @staticmethod
+    def _dashboard_json() -> str:
+        return json.dumps({
+            "stock_name": "贵州茅台",
+            "sentiment_score": 72,
+            "trend_prediction": "up",
+            "operation_advice": "buy",
+            "decision_type": "buy",
+            "confidence_level": "高",
+            "dashboard": {
+                "phase_decision": {
+                    "phase_context": "regular",
+                    "action_window": "now",
+                    "immediate_action": "watch",
+                    "watch_conditions": [],
+                    "next_check_time": "next session",
+                    "confidence_reason": "fixture",
+                    "data_limitations": [],
+                },
+                "core_conclusion": {
+                    "one_sentence": "fixture decision",
+                    "signal_type": "buy",
+                    "position_advice": {"no_position": "watch", "has_position": "hold"},
+                },
+            },
+            "analysis_summary": "fixture summary",
+            "key_points": ["fixture"],
+            "risk_warning": "",
+        }, ensure_ascii=False)
+
+    def _run_multi_agent(self, mode: str):
+        from src.agent.orchestrator import AgentOrchestrator
+
+        orchestrator = AgentOrchestrator(
+            tool_registry=MagicMock(), llm_adapter=MagicMock(), mode=mode,
+        )
+        ctx = orchestrator._build_context(
+            "分析 600519",
+            context={
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "cross_asset_context": _risk_off_context().to_safe_dict(),
+            },
+        )
+        captured_messages = []
+
+        def fake_run_agent_loop(messages, **kwargs):
+            captured_messages.append(messages)
+            return SimpleNamespace(
+                success=True,
+                content=self._dashboard_json(),
+                total_tokens=11,
+                tool_calls_log=[],
+                models_used=["test/model"],
+                total_steps=1,
+                failure_reason=None,
+            )
+
+        with patch(
+            "src.agent.agents.base_agent.run_agent_loop",
+            side_effect=fake_run_agent_loop,
+        ):
+            result = orchestrator._execute_pipeline(ctx, parse_dashboard=False)
+
+        chain_names = [agent.agent_name for agent in orchestrator._build_agent_chain(ctx)]
+        return result, captured_messages, chain_names
+
+    @staticmethod
+    def _joined(messages) -> str:
+        return "\n".join(str(message.get("content", "")) for message in messages)
+
+    def test_standard_chain_every_stage_receives_summary(self):
+        result, captured, chain_names = self._run_multi_agent("standard")
+
+        assert result.success
+        assert chain_names == ["technical", "intel", "decision"]
+        assert len(captured) == 3
+        for messages in captured:
+            joined = self._joined(messages)
+            assert "BEGIN_UNTRUSTED_CROSS_ASSET_SUMMARY" in joined
+            assert "END_UNTRUSTED_CROSS_ASSET_SUMMARY" in joined
+            assert "risk-off" in joined
+
+    def test_quick_chain_every_stage_receives_summary(self):
+        result, captured, chain_names = self._run_multi_agent("quick")
+
+        assert result.success
+        assert chain_names == ["technical", "decision"]
+        assert len(captured) == 2
+        for messages in captured:
+            joined = self._joined(messages)
+            assert "BEGIN_UNTRUSTED_CROSS_ASSET_SUMMARY" in joined
+            assert "risk-off" in joined
+
+    def test_full_chain_risk_stage_renders_summary_exactly_once(self):
+        """RiskAgent renders the section in its own user message; the shared
+        BaseAgent injection must opt out for it (no duplicated block)."""
+        result, captured, chain_names = self._run_multi_agent("full")
+
+        assert chain_names == ["technical", "intel", "risk", "decision"]
+        risk_joined = self._joined(captured[chain_names.index("risk")])
+        assert risk_joined.count("BEGIN_UNTRUSTED_CROSS_ASSET_SUMMARY") == 1
+        assert "risk-off" in risk_joined
+
+    def test_no_cross_asset_context_means_no_section(self):
+        from src.agent.orchestrator import AgentOrchestrator
+
+        orchestrator = AgentOrchestrator(
+            tool_registry=MagicMock(), llm_adapter=MagicMock(), mode="standard",
+        )
+        ctx = orchestrator._build_context(
+            "分析 600519", context={"stock_code": "600519", "stock_name": "贵州茅台"},
+        )
+        captured_messages = []
+
+        def fake_run_agent_loop(messages, **kwargs):
+            captured_messages.append(messages)
+            return SimpleNamespace(
+                success=True,
+                content=self._dashboard_json(),
+                total_tokens=11,
+                tool_calls_log=[],
+                models_used=["test/model"],
+                total_steps=1,
+                failure_reason=None,
+            )
+
+        with patch(
+            "src.agent.agents.base_agent.run_agent_loop",
+            side_effect=fake_run_agent_loop,
+        ):
+            result = orchestrator._execute_pipeline(ctx, parse_dashboard=False)
+
+        assert result.success
+        for messages in captured_messages:
+            joined = self._joined(messages)
+            assert "外围环境与跨资产" not in joined
+            assert "BEGIN_UNTRUSTED_CROSS_ASSET_SUMMARY" not in joined
 
 
 # ---------------------------------------------------------------------------

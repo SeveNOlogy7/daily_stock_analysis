@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 class RiskAgent(BaseAgent):
     agent_name = "risk"
     max_steps = 4
+    # Issue #1910 / OR-COR-f88926c2: RiskAgent renders the cross-asset section
+    # itself inside build_user_message (next to its reasoning instructions);
+    # the BaseAgent shared injection stays off to avoid duplication.
+    renders_cross_asset_section_in_own_message = True
     tool_names = [
         "search_stock_news",
         "get_realtime_quote",
@@ -154,4 +158,3 @@ def _risk_to_signal(risk_level: str) -> str:
         "high": "strong_sell",
     }
     return mapping.get(risk_level, "hold")
-
