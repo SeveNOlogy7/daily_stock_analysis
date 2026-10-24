@@ -421,6 +421,8 @@ class DailyHistoryItem(BaseModel):
     )
     sentiment_label: str = Field("", description="本地化情绪标签（由 sentiment_score 阈值得出）")
     operation_advice: Optional[str] = Field(None, description="操作建议")
+    action: Optional[DecisionAction] = Field(None, description="结构化建议动作 taxonomy")
+    action_label: Optional[str] = Field(None, description="建议动作展示标签")
     trend_prediction: Optional[str] = Field(None, description="趋势预测")
     is_latest: bool = Field(
         ...,

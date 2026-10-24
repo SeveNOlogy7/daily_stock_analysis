@@ -14,6 +14,7 @@ import {
   Pagination,
 } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/decisionAction';
 import type { DailyHistoryItem, DailyHistoryListResponse } from '../types/analysis';
 import { formatDateTime, toDateInputValue } from '../utils/format';
 
@@ -43,6 +44,7 @@ function renderSentimentCell(item: DailyHistoryItem): React.ReactNode {
 
 const HistoryPage: React.FC = () => {
   const { t, language } = useUiLanguage();
+  const actionLabels = buildDecisionActionLabelMap(t);
   const [date, setDate] = useState<string>(() => toDateInputValue(new Date()));
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<DailyHistoryItem[]>([]);
@@ -159,7 +161,15 @@ const HistoryPage: React.FC = () => {
                   <tr key={item.id}>
                     <td className="px-3 py-3">{renderStockCell(item)}</td>
                     <td className="px-3 py-3">{renderSentimentCell(item)}</td>
-                    <td className="px-3 py-3">{item.operationAdvice ?? '—'}</td>
+                    <td className="px-3 py-3">
+                      {getDecisionActionLabel(
+                        item.action,
+                        item.actionLabel,
+                        item.operationAdvice,
+                        item.operationAdvice ?? '—',
+                        actionLabels,
+                      )}
+                    </td>
                     <td className="px-3 py-3">{item.trendPrediction ?? '—'}</td>
                     <td className="px-3 py-3">
                       {item.isLatest ? (

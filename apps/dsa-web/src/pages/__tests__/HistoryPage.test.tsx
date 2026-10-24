@@ -89,6 +89,28 @@ describe('HistoryPage', () => {
     });
   });
 
+  it('shows the structured avoid action instead of legacy buy advice', async () => {
+    getDaily.mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [
+        {
+          ...latestItem,
+          sentimentScore: 35,
+          operationAdvice: '买入',
+          action: 'avoid',
+          actionLabel: '回避',
+        },
+      ],
+    });
+
+    render(<HistoryPage />);
+
+    expect(await screen.findByText('回避')).toBeInTheDocument();
+    expect(screen.queryByText('买入')).not.toBeInTheDocument();
+  });
+
   it('renders the empty state when the date has no analysis records', async () => {
     getDaily.mockResolvedValue({ total: 0, page: 1, limit: 20, items: [] });
 

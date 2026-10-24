@@ -603,6 +603,8 @@ export interface DailyHistoryItem {
   sentimentScore: number | null;
   sentimentLabel: string;
   operationAdvice: string | null;
+  action?: DecisionAction | null;
+  actionLabel?: string | null;
   trendPrediction: string | null;
   isLatest: boolean;
   idealBuy: number | null;

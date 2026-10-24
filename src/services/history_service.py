@@ -511,6 +511,10 @@ class HistoryService:
             group_key = self._daily_group_key(raw_code, display_code)
             score = getattr(record, "sentiment_score", None)
             record_id = int(getattr(record, "id", 0) or 0)
+            # 与 /stocks 路径同源的最终动作解析：优先 raw_result 结构化 action，
+            # 避免 operation_advice 旧文案把 'avoid' 覆盖显示成 '买入'。
+            raw_result = parse_json_field(getattr(record, "raw_result", None))
+            action_fields = self._decision_action_fields_for_record(record, raw_result)
             items.append(
                 {
                     "id": record_id,
@@ -522,6 +526,8 @@ class HistoryService:
                         int(score) if score is not None else 0, language
                     ),
                     "operation_advice": getattr(record, "operation_advice", None),
+                    "action": action_fields["action"],
+                    "action_label": action_fields["action_label"],
                     "trend_prediction": getattr(record, "trend_prediction", None),
                     "is_latest": global_latest_by_group.get(group_key) == record_id,
                     "ideal_buy": getattr(record, "ideal_buy", None),

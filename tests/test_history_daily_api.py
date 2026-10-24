@@ -9,6 +9,7 @@ unittest.TestCase + FastAPI TestClient + DatabaseManager.reset_instance() + 真�
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -43,6 +44,8 @@ DAILY_CONTRACT_KEYS = {
     "sentiment_score",
     "sentiment_label",
     "operation_advice",
+    "action",
+    "action_label",
     "trend_prediction",
     "is_latest",
     "ideal_buy",
@@ -101,6 +104,7 @@ class HistoryDailyApiTestCase(unittest.TestCase):
             secondary_buy=kwargs.get("secondary_buy", 10.2),
             stop_loss=kwargs.get("stop_loss", 9.5),
             take_profit=kwargs.get("take_profit", 12.0),
+            raw_result=kwargs.get("raw_result"),
             created_at=created_at,
         )
         with self.db.get_session() as session:
@@ -281,6 +285,39 @@ class HistoryDailyApiTestCase(unittest.TestCase):
         self.assertEqual(item["id"], suffix_id)
         self.assertEqual(item["code"], "002460.SZ")
         self.assertTrue(item["is_latest"])
+
+    def test_10_structured_action_overrides_legacy_advice(self) -> None:
+        """结构化动作优先：raw action='avoid' + 旧文案 operation_advice='买入' → 最终动作 回避。"""
+        self._add_history(
+            "600519",
+            D1,
+            sentiment_score=35,
+            operation_advice="买入",
+            raw_result=json.dumps({"action": "avoid", "operation_advice": "买入"}),
+        )
+
+        resp = self._get_daily()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        item = resp.json()["items"][0]
+        self.assertEqual(item["action"], "avoid")
+        self.assertEqual(item["action_label"], "回避")
+        # 原始文案字段保持原样，不回写
+        self.assertEqual(item["operation_advice"], "买入")
+
+    def test_11_action_falls_back_to_advice_without_structured_action(self) -> None:
+        """无结构化 action 时按旧文案派生最终动作（与 /stocks 路径同语义）。"""
+        self._add_history(
+            "600519",
+            D1,
+            sentiment_score=35,
+            operation_advice="不建议买入，等待确认",
+        )
+
+        resp = self._get_daily()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        item = resp.json()["items"][0]
+        self.assertEqual(item["action"], "avoid")
+        self.assertEqual(item["action_label"], "回避")
 
 
 if __name__ == "__main__":
