@@ -3399,7 +3399,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         获取每只股票（raw code 维度）全局最新一条分析记录的主键 ID（issue #1661）。
 
         单次聚合查询（无日期过滤），供服务层判断记录时效性（is_latest），
-        避免逐条查询的 N+1。
+        避免逐条查询的 N+1。排除 code='MARKET' 与 report_type='market_review'，
+        与当日去重谓词（get_daily_latest_per_code）保持一致。
 
         Returns:
             Dict: raw code -> 该 code 全局最新记录的主键 id
@@ -3409,7 +3410,17 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 select(
                     AnalysisHistory.code,
                     func.max(AnalysisHistory.id).label("max_id"),
-                ).group_by(AnalysisHistory.code)
+                )
+                .where(
+                    and_(
+                        AnalysisHistory.code != "MARKET",
+                        or_(
+                            AnalysisHistory.report_type.is_(None),
+                            AnalysisHistory.report_type != "market_review",
+                        ),
+                    )
+                )
+                .group_by(AnalysisHistory.code)
             ).all()
             return {str(row.code): int(row.max_id) for row in rows if row.code}
 

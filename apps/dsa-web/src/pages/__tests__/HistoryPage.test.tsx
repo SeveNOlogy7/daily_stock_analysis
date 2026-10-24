@@ -133,4 +133,16 @@ describe('HistoryPage', () => {
     expect(await screen.findByText('已过期')).toBeInTheDocument();
     expect(screen.queryByText('有效')).not.toBeInTheDocument();
   });
+
+  it('does not trigger a new fetch when the date input is cleared', async () => {
+    render(<HistoryPage />);
+
+    expect(await screen.findByText('贵州茅台')).toBeInTheDocument();
+    const callsBeforeClear = getDaily.mock.calls.length;
+    fireEvent.change(screen.getByLabelText('日期'), { target: { value: '' } });
+
+    await waitFor(() => {
+      expect(getDaily.mock.calls.length).toBe(callsBeforeClear);
+    });
+  });
 });

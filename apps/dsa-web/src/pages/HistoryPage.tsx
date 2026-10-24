@@ -90,6 +90,7 @@ const HistoryPage: React.FC = () => {
   }, [loadDaily]);
 
   const handleDateChange = (nextDate: string) => {
+    if (!nextDate) return; // <input type="date"> 清空产生 ""，直接发请求注定 422
     setDate(nextDate);
     setPage(1);
   };
@@ -114,7 +115,6 @@ const HistoryPage: React.FC = () => {
             aria-label={t('history.dateLabel')}
             onChange={(event) => handleDateChange(event.target.value)}
           />
-          {loading ? <span className="text-xs text-secondary-text">{t('history.loading')}</span> : null}
         </label>
       </Card>
 
