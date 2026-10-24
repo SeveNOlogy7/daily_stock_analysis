@@ -13,11 +13,14 @@ TdxLocalFetcher - 通达信本地 vipdoc 日线数据源
    见 ``DataFetcherManager._init_default_fetchers``）。
 2. 请求期目录失效（被移动/删除）时 ``is_available_for_request`` 返回 False，
    管理器跳过本源（D4 双保险之可用性探针，样板 pytdx_fetcher.py:168）。
-3. 缺文件/BSE/港股/窗口无交集一律返回空 DataFrame（D6）：空结果不进日线熔断器
-   （抛异常 3 次会触发 300s 熔断），管理器记 empty 后继续下一个网络源。
+3. 缺文件/BSE/港股/窗口无交集/窗口头部缺口一律返回空 DataFrame（D6）：空结果不进
+   日线熔断器（抛异常 3 次会触发 300s 熔断），管理器记 empty 后继续下一个网络源。
+   头部缺口（请求窗口起点早于本地最早 bar，如中途才安装 TDX）同样返回空回退，
+   不以部分数据"成功"终止回退链。
 4. 过期回退（D5）：本地最新 bar 落后请求窗口 end_date 超过
    ``TDX_LOCAL_MAX_STALE_DAYS``（默认 10 个日历日，覆盖国庆长假）→ 返回空结果
    回退网络源。基准是 end_date 而非今天：回测等历史窗口且本地已覆盖时不判过期。
+   合法阈值 0（零容忍滞后）被保留，不会被默认值替换。
 5. 代码→vipdoc 路径映射对齐 ``PytdxFetcher._get_market_code``（D8）：显式
    前缀/后缀两种风格 + 裸 6 位码按 60/68→sh、其余→sz。
 """
@@ -147,17 +150,24 @@ class TdxLocalFetcher(BaseFetcher):
                 start_date,
                 end_date,
             )
-        elif window["date"].iloc[0] > start_ts:
-            # D5：历史窗口头部缺口（用户中途安装 TDX）不判失败，
-            # 返回窗口内已有行 + head-gap warning。
+            return self._empty_frame()
+
+        if window["date"].iloc[0] > start_ts:
+            # D5：历史窗口头部缺口（用户中途安装 TDX、本地历史不足覆盖请求窗口）
+            # → 返回空结果回退网络源。部分数据不得以"成功"身份终止回退，否则
+            # 管理器视作成功后网络源没有机会补齐，下游对不足历史直接报错且写库
+            # 后重试无法自愈。头部完整性与尾部新鲜度（上方 max_stale_days）
+            # 同等对待；本地完全覆盖窗口时仍由本地服务（本地优先不变）。
             logger.warning(
-                "TdxLocalFetcher 本地数据晚于请求窗口起点（头部缺口）: %s, "
-                "窗口起点=%s, 本地最早 bar=%s, 仅返回窗口内已有 %d 行",
+                "TdxLocalFetcher 本地数据晚于请求窗口起点（头部缺口），回退网络源: %s, "
+                "窗口起点=%s, 本地最早 bar=%s, 窗口内仅 %d 行不足以完整覆盖",
                 stock_code,
                 start_date,
                 window["date"].iloc[0].strftime("%Y-%m-%d"),
                 len(window),
             )
+            return self._empty_frame()
+
         return window
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:

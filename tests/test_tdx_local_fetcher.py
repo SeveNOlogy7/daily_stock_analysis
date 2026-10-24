@@ -378,6 +378,46 @@ class _FakeNetworkFetcher(BaseFetcher):
         return df[keep]
 
 
+class _FullWindowNetworkFetcher(BaseFetcher):
+    """管理器回退测试用的网络源替身：返回请求窗口内每一天一行的完整数据。"""
+
+    name = "FakeFullNetworkFetcher"
+    priority = 1
+
+    def __init__(self, priority: int = 1):
+        super().__init__()
+        self.priority = priority
+        self.calls = []
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((stock_code, start_date, end_date))
+        span = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days
+        dates = [
+            pd.Timestamp(start_date) + pd.Timedelta(days=offset)
+            for offset in range(span + 1)
+        ]
+        return pd.DataFrame(
+            [
+                {
+                    "date": day,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000,
+                    "amount": 100500.0,
+                }
+                for day in dates
+            ]
+        )
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        df = df.copy()
+        df["code"] = stock_code
+        keep = ["code"] + [c for c in STANDARD_COLUMNS if c in df.columns]
+        return df[keep]
+
+
 def _consecutive_dates(end_day, count: int):
     """以 ``end_day`` 结尾的 ``count`` 个连续日历日（最新 bar 即 end_day）。"""
     return [end_day - timedelta(days=offset) for offset in range(count - 1, -1, -1)]
@@ -485,10 +525,14 @@ def test_historical_end_date_uses_end_not_today(tmp_path, monkeypatch):
     assert len(df) == 30
 
 
-def test_head_gap_returns_partial_with_warning(tmp_path, monkeypatch, caplog):
-    """请求窗口起点早于本地最早 bar → 返回窗口内已有行 + head-gap warning。"""
+def test_head_gap_returns_empty_to_continue_fallback(tmp_path, monkeypatch, caplog):
+    """窗口起点早于本地最早 bar（头部缺口）→ 本源返回空结果，不以部分数据"成功"终止回退。
+
+    OpenReview OR-COR-364fe4b2 回归：旧实现返回窗口内已有行，管理器视作
+    成功立即结束回退，网络源没有机会补齐不足历史。
+    """
     fetcher = _make_fetcher(tmp_path, monkeypatch)
-    dates = _consecutive_dates(date(2026, 1, 30), 11)  # 本地 01-20..01-30，窗口 01-01 起
+    dates = _consecutive_dates(date(2026, 1, 30), 11)  # 本地仅 01-20..01-30，窗口 01-01 起
     _write_day_file(
         tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
         _records_for_dates(dates),
@@ -499,9 +543,29 @@ def test_head_gap_returns_partial_with_warning(tmp_path, monkeypatch, caplog):
             "600519", start_date="2026-01-01", end_date="2026-01-30"
         )
 
-    assert len(df) == 11
-    assert df["date"].iloc[0] == pd.Timestamp("2026-01-20")
+    assert df.empty
     assert any("头部缺口" in record.getMessage() for record in caplog.records)
+
+
+def test_head_gap_manager_falls_back_to_full_network_window(tmp_path, monkeypatch):
+    """本地仅最新 11 根 bar、趋势工具请求 60 天 → 管理器回退网络源拿全窗口 60 天。"""
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    # 本地尾部新鲜（最新 bar == end 06-30，滞后 0 天不判过期），头部只有 11 个日历日
+    dates = _consecutive_dates(date(2026, 6, 30), 11)
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    fake = _FullWindowNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-05-02", end_date="2026-06-30"
+    )
+
+    assert source == "FakeFullNetworkFetcher"
+    assert len(df) == 60  # 完整 60 天窗口，而非本地 11 天
+    assert len(fake.calls) == 1
 
 
 def test_missing_day_file_returns_empty_not_raise(tmp_path, monkeypatch):
@@ -650,7 +714,9 @@ def test_non_trading_day_end_date(tmp_path, monkeypatch):
         _records_for_dates(dates),
     )
 
-    df = fetcher.get_daily_data("600519", start_date="2026-01-01", end_date="2026-01-11")
+    # 窗口起点取本地最早 bar（头部完整性语义独立于过期判定：起点早于本地最早
+    # bar 属头部缺口，走 OR-COR-364fe4b2 的空结果回退路径，与本例无关）。
+    df = fetcher.get_daily_data("600519", start_date="2026-01-05", end_date="2026-01-11")
 
     assert len(df) == 5
     assert df["date"].iloc[-1] == pd.Timestamp("2026-01-09")
