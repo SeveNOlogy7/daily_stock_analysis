@@ -601,7 +601,7 @@ export interface DailyHistoryItem {
   name: string;
   reportType: string;
   sentimentScore: number | null;
-  sentimentLabel: string;
+  sentimentLabel: string | null;
   operationAdvice: string | null;
   action?: DecisionAction | null;
   actionLabel?: string | null;

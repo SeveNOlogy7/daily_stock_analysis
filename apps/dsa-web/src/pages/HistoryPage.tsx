@@ -37,7 +37,9 @@ function renderSentimentCell(item: DailyHistoryItem): React.ReactNode {
   return (
     <div className="min-w-0">
       <div className="text-foreground">{item.sentimentScore == null ? '—' : item.sentimentScore}</div>
-      <div className="text-xs text-secondary-text">{item.sentimentLabel}</div>
+      {item.sentimentLabel == null ? null : (
+        <div className="text-xs text-secondary-text">{item.sentimentLabel}</div>
+      )}
     </div>
   );
 }

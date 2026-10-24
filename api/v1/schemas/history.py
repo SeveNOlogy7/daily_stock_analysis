@@ -419,7 +419,10 @@ class DailyHistoryItem(BaseModel):
         None,
         description="情绪评分（历史数据可能超出 0-100 范围，读取时不做约束）",
     )
-    sentiment_label: str = Field("", description="本地化情绪标签（由 sentiment_score 阈值得出）")
+    sentiment_label: Optional[str] = Field(
+        None,
+        description="本地化情绪标签（由 sentiment_score 阈值得出；score 缺失时为 null）",
+    )
     operation_advice: Optional[str] = Field(None, description="操作建议")
     action: Optional[DecisionAction] = Field(None, description="结构化建议动作 taxonomy")
     action_label: Optional[str] = Field(None, description="建议动作展示标签")

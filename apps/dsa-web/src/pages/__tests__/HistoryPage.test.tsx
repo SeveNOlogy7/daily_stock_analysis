@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import HistoryPage from '../HistoryPage';
+import { getSentimentLabel } from '../../types/analysis';
 import { toDateInputValue } from '../../utils/format';
 
 const { getDaily } = vi.hoisted(() => ({
@@ -21,7 +22,8 @@ const latestItem = {
   name: '贵州茅台',
   reportType: 'detailed',
   sentimentScore: 82,
-  sentimentLabel: '极度乐观',
+  // 走真实标签函数生成，避免 mock 硬编码绕过标签契约
+  sentimentLabel: getSentimentLabel(82, 'zh'),
   operationAdvice: '持有观望',
   trendPrediction: '震荡上行',
   isLatest: true,
@@ -38,7 +40,7 @@ const expiredItem = {
   code: '000001',
   name: '平安银行',
   sentimentScore: null,
-  sentimentLabel: '中性',
+  sentimentLabel: null,
   operationAdvice: null,
   trendPrediction: null,
   isLatest: false,
@@ -154,6 +156,18 @@ describe('HistoryPage', () => {
 
     expect(await screen.findByText('已过期')).toBeInTheDocument();
     expect(screen.queryByText('有效')).not.toBeInTheDocument();
+  });
+
+  it('keeps null-score rows labelless instead of the zero-score label', async () => {
+    getDaily.mockResolvedValue({ total: 1, page: 1, limit: 20, items: [expiredItem] });
+
+    render(<HistoryPage />);
+
+    expect(await screen.findByText('平安银行')).toBeInTheDocument();
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(1);
+    // NULL 评分不渲染任何情绪标签，更不能显示 0 分的"极度悲观"
+    expect(screen.queryByText('极度悲观')).not.toBeInTheDocument();
+    expect(screen.queryByText(getSentimentLabel(0, 'zh'))).not.toBeInTheDocument();
   });
 
   it('does not trigger a new fetch when the date input is cleared', async () => {

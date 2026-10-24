@@ -319,6 +319,21 @@ class HistoryDailyApiTestCase(unittest.TestCase):
         self.assertEqual(item["action"], "avoid")
         self.assertEqual(item["action_label"], "回避")
 
+    def test_12_null_score_keeps_null_label(self) -> None:
+        """sentiment_score=NULL → label=null；真实 0 分仍产出 极度悲观（评审 OR-COR-82e95195）。"""
+        null_id = self._add_history("600519", D1, sentiment_score=None)
+        zero_id = self._add_history("000001", D1, sentiment_score=0)
+
+        resp = self._get_daily()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        payload = resp.json()
+        self.assertEqual(payload["total"], 2)
+        by_id = {item["id"]: item for item in payload["items"]}
+        self.assertIsNone(by_id[null_id]["sentiment_score"])
+        self.assertIsNone(by_id[null_id]["sentiment_label"])
+        self.assertEqual(by_id[zero_id]["sentiment_score"], 0)
+        self.assertEqual(by_id[zero_id]["sentiment_label"], "极度悲观")
+
 
 if __name__ == "__main__":
     unittest.main()

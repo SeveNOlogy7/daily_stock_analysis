@@ -522,8 +522,11 @@ class HistoryService:
                     "name": str(getattr(record, "name", None) or ""),
                     "report_type": str(getattr(record, "report_type", None) or ""),
                     "sentiment_score": score,
-                    "sentiment_label": get_sentiment_label(
-                        int(score) if score is not None else 0, language
+                    # score 缺失（NULL）保持 label 缺失，不落回 0 分的"极度悲观"。
+                    "sentiment_label": (
+                        get_sentiment_label(int(score), language)
+                        if score is not None
+                        else None
                     ),
                     "operation_advice": getattr(record, "operation_advice", None),
                     "action": action_fields["action"],
