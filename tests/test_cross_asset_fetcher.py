@@ -19,6 +19,7 @@ Plus the FX cache-first contract (portfolio cache hit / stale / miss / broken).
 from __future__ import annotations
 
 import itertools
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -91,7 +92,9 @@ class TestSuccessThreeMarkets:
             "data_provider.akshare_fetcher._akshare_call_with_timeout",
             MagicMock(return_value=batch),
         ), _patch_yf(
-            {"^VIX": (FRESH_AS_OF, 16.5, 15.8), "^TNX": (FRESH_AS_OF, 42.1, 41.5)}
+            # OR-COR-7bbac105: Yahoo Close is ALREADY a percent quantity
+            # (4.21 = 4.21%); it must pass through unscaled.
+            {"^VIX": (FRESH_AS_OF, 16.5, 15.8), "^TNX": (FRESH_AS_OF, 4.21, 4.15)}
         ):
             snapshot = fetcher.fetch_market_snapshot("cn", TRADE_DATE)
 
@@ -104,7 +107,7 @@ class TestSuccessThreeMarkets:
         assert snapshot["indices"]["sz399006"].change_pct == pytest.approx(-1.81, abs=0.01)
         for item in snapshot["indices"].values():
             _assert_quadruple(item)
-        # US 10Y (^TNX) is normalized from yield*10 to a percent yield
+        # US 10Y (^TNX) passes through as the percent yield Yahoo already quotes
         assert snapshot["rates"]["US10Y"].status == "ok"
         assert snapshot["rates"]["US10Y"].value == pytest.approx(4.21, abs=0.001)
         _assert_quadruple(snapshot["rates"]["US10Y"])
@@ -201,7 +204,7 @@ class TestStaleMarking:
 
     def test_rates_use_stricter_threshold_than_default(self):
         two_days_old = TRADE_DATE - timedelta(days=2)
-        table = {"^TNX": (two_days_old, 42.1, 41.5), "^VIX": (two_days_old, 17.0, 16.0)}
+        table = {"^TNX": (two_days_old, 4.21, 4.15), "^VIX": (two_days_old, 17.0, 16.0)}
         fetcher = CrossAssetFetcher(fx_repo=MagicMock(), stale_days=2)
         with _patch_yf(table):
             snapshot = fetcher.fetch_market_snapshot("us", TRADE_DATE)
@@ -389,6 +392,94 @@ class TestDollarIndexKey:
         assert "DXY" in timeout_group
         assert "DXYDXY" not in timeout_group
         assert timeout_group["DXY"].error == "timeout"
+
+
+class TestTnxNoDoubleScaling:
+    """OR-COR-7bbac105 — ^TNX Close from Yahoo is already quoted in percent
+    (4.21 = 4.21%); the former unconditional ``value / 10`` reported a yield
+    ten times too small."""
+
+    def test_tnx_close_passes_through_unscaled(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock())
+        with _patch_yf({"^TNX": (FRESH_AS_OF, 4.21, 4.15)}):
+            snapshot = fetcher.fetch_market_snapshot("us", TRADE_DATE)
+
+        item = snapshot["rates"]["US10Y"]
+        assert item.status == "ok"
+        assert item.value == pytest.approx(4.21, abs=0.0001)
+        # change_pct is computed from the raw closes: (4.21-4.15)/4.15*100
+        assert item.change_pct == pytest.approx(1.45, abs=0.01)
+
+    def test_high_yield_regime_also_passes_through(self):
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock())
+        with _patch_yf({"^TNX": (FRESH_AS_OF, 4.995, 4.98)}):
+            snapshot = fetcher.fetch_market_snapshot("us", TRADE_DATE)
+
+        assert snapshot["rates"]["US10Y"].value == pytest.approx(4.995, abs=0.0001)
+
+
+class TestYfSeriesTimestampCoercion:
+    """OR-COR-ce1b6a21 — the real pandas DatetimeIndex label must flow through
+    the REAL ``_fetch_yf_series`` (only yfinance itself is stubbed) and come
+    out as a date; the former ``getattr(last_index, "date", last_index)`` handed
+    the bound method to the converter so every yfinance success was
+    ``as_of=None`` / ``stale=True``."""
+
+    @staticmethod
+    def _yf_stub(frame):
+        return SimpleNamespace(
+            Ticker=lambda symbol: SimpleNamespace(
+                history=lambda period=None, auto_adjust=None: frame
+            )
+        )
+
+    def test_real_datetime_index_yields_as_of_date(self):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {"Close": [41.9, 42.7]},
+            index=pd.DatetimeIndex(["2026-10-21", "2026-10-22"]),
+        )
+        with patch.dict(sys.modules, {"yfinance": self._yf_stub(frame)}):
+            series = CrossAssetFetcher._fetch_yf_series("^GSPC")
+
+        assert series is not None
+        as_of, last, prev = series
+        assert as_of == date(2026, 10, 22)
+        assert last == pytest.approx(42.7)
+        assert prev == pytest.approx(41.9)
+
+    def test_string_index_still_parses(self):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {"Close": [5800.0, 5810.0]},
+            index=["2026-10-21", "2026-10-22"],
+        )
+        with patch.dict(sys.modules, {"yfinance": self._yf_stub(frame)}):
+            series = CrossAssetFetcher._fetch_yf_series("^GSPC")
+
+        assert series is not None
+        as_of, last, _prev = series
+        assert as_of == date(2026, 10, 22)
+        assert last == pytest.approx(5810.0)
+
+    def test_snapshot_ok_item_carries_as_of_and_is_not_falsely_stale(self):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {"Close": [41.9, 42.7]},
+            index=pd.DatetimeIndex(["2026-10-21", "2026-10-22"]),
+        )
+        fetcher = CrossAssetFetcher(fx_repo=MagicMock())
+        with patch.dict(sys.modules, {"yfinance": self._yf_stub(frame)}):
+            snapshot = fetcher.fetch_market_snapshot("us", TRADE_DATE)
+
+        item = snapshot["rates"]["US10Y"]
+        assert item.status == "ok"
+        assert item.as_of == "2026-10-22"  # was None before the fix
+        assert item.stale is False  # was True-by-None before the fix
+        _assert_quadruple(item)
 
 
 class TestBudgetDeadlineIsolation:

@@ -168,6 +168,27 @@ def _coerce_date_value(value: Any) -> Optional[date]:
     return None
 
 
+def _index_label_date(value: Any) -> Any:
+    """Unwrap a series index label to its ``.date()`` when it has one.
+
+    OR-COR-ce1b6a21: pandas Timestamp / datetime labels expose ``.date`` as a
+    bound method — it must be CALLED, not handed to ``_coerce_date_value``
+    (which silently returned None for method objects and marked every
+    yfinance success as as_of=None / stale=True). String labels pass through
+    to the string parsing branch unchanged.
+    """
+
+    date_attr = getattr(value, "date", None)
+    if callable(date_attr):
+        try:
+            extracted = date_attr()
+        except Exception:
+            return value
+        if isinstance(extracted, (datetime, date)):
+            return extracted
+    return value
+
+
 def _change_pct(last: float, prev: float) -> Optional[float]:
     if prev is None or prev == 0:
         return None
@@ -530,9 +551,9 @@ class CrossAssetFetcher:
                 error="no_data",
             )
         as_of, last, prev = series
+        # OR-COR-7bbac105: Yahoo Close (^TNX included) is already quoted as a
+        # percent quantity (4.21 = 4.21%); no further scaling is applied.
         value = last
-        if symbol == "^TNX" and value is not None:
-            value = round(value / 10.0, 4)  # ^TNX quotes yield*10; normalize to percent yield
         return CrossAssetItem(
             status="ok",
             value=value,
@@ -557,7 +578,7 @@ class CrossAssetFetcher:
         if close.empty:
             return None
         last_index = close.index[-1]
-        as_of = _coerce_date_value(getattr(last_index, "date", last_index))
+        as_of = _coerce_date_value(_index_label_date(last_index))
         last = float(close.iloc[-1])
         prev = float(close.iloc[-2]) if len(close) > 1 else last
         if last <= 0:
