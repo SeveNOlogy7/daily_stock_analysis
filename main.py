@@ -387,6 +387,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--news-digest',
+        action='store_true',
+        help='仅运行一次消息面汇总（盘前/周末/节假日；force 预览，跳过窗口与每日一次限制）'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -1619,6 +1625,53 @@ def _reload_runtime_config() -> Config:
     return new_config
 
 
+def _append_news_digest_background_task(background_tasks, config_provider) -> None:
+    """CLI 定时模式挂载消息面汇总后台任务（issue #2184 D10(a)）。
+
+    disabled → 不挂载；构建抛异常仅告警跳过（不影响定时模式启动）。
+    """
+    try:
+        from src.services.news_digest_service import build_news_digest_background_task
+
+        entry = build_news_digest_background_task(config_provider=config_provider)
+    except Exception as exc:
+        logger.warning("消息面汇总后台任务构建失败，跳过挂载: %s", exc)
+        return
+    if entry is not None:
+        background_tasks.append(entry)
+        logger.info(
+            "消息面汇总后台任务已挂载: interval=%ss", entry.get("interval_seconds")
+        )
+
+
+def _run_news_digest_once_cli(config) -> int:
+    """``--news-digest`` 一次性入口（issue #2184 D11，含 critic MINOR-1）。
+
+    force=True 预览语义：跳过 enabled/窗口判定/claim 占用，但仍带 dedup_key 推送。
+    无论推送结果如何，先把生成的 Markdown 摘要打印到 stdout（dedup 吞掉通知时
+    CLI 不得表现为"无事发生"），再输出推送状态行。
+    """
+    from datetime import datetime
+
+    from src.services.news_digest_service import run_news_digest_once
+
+    logger.info("模式: 仅消息面汇总（--news-digest，force 预览）")
+    result = run_news_digest_once(config, now=datetime.now(), force=True)
+
+    report = ""
+    status = "unknown"
+    if isinstance(result, dict):
+        status = str(result.get("status") or "unknown")
+        report = str(result.get("report") or "")
+    if report:
+        print(report)
+    else:
+        print("（本次未生成消息面汇总内容）")
+    print(f"[news-digest] status={status}")
+    logger.info("消息面汇总推送状态: %s", result)
+    return 0 if status == "success" else 1
+
+
 def _build_schedule_time_provider(default_schedule_time: str):
     """Read the latest schedule time directly from the active config file.
 
@@ -1934,6 +1987,11 @@ def main() -> int:
             )
             return 0 if market_review_result else 1
 
+        # 模式1.5: 仅消息面汇总（CLI 一次性入口，issue #2184 D11）
+        # 无需交易日过滤：本功能的周末/节假日场景本来就要跑，--force-run 不适用。
+        if getattr(args, 'news_digest', False):
+            return _run_news_digest_once_cli(config)
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             if start_serve:
@@ -2061,6 +2119,9 @@ def main() -> int:
                     "run_immediately": True,
                     "name": "agent_event_monitor",
                 })
+
+            # 消息面汇总后台任务（issue #2184 D10(a)）：disabled → 不挂载
+            _append_news_digest_background_task(background_tasks, _reload_runtime_config)
 
             schedule_kwargs = {
                 "task": scheduled_task,

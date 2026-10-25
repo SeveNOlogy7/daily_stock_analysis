@@ -48,6 +48,9 @@ NEWS_DIGEST_TOPICS_LIMIT = 5
 NEWS_DIGEST_DEFAULT_MAX_NEWS = 12
 NEWS_DIGEST_MAX_NEWS_CEILING = 30
 
+NEWS_DIGEST_DEFAULT_INTERVAL_MINUTES = 10
+NEWS_DIGEST_BACKGROUND_TASK_NAME = "news_digest"
+
 MAX_PROMPT_NEWS = 6
 _TRUNCATE_TITLE = 90
 _TRUNCATE_SNIPPET = 220
@@ -942,6 +945,9 @@ def run_news_digest_once(
             "entries_count": len(entries), "search_ok": search_ok,
             "feed_ok": feed_ok, "summarized": bool(summary_text),
             "notified": bool(notified), "history_id": int(history_id or 0),
+            # D11：CLI 一次性入口需要把 Markdown 摘要打印到 stdout（即使通知层
+            # 被 dedup_key 吞掉）；调度 tick 日志只取标量字段，不回显全文。
+            "report": report,
         }
     except Exception as exc:  # noqa: BLE001 - 未预期异常：释放 claim，不上抛
         logger.error("NEWS_DIGEST 未预期异常，释放 claim 待窗口内重试: %s", exc)
@@ -954,3 +960,125 @@ def run_news_digest_once(
             "reason": f"unexpected_error: {type(exc).__name__}",
             "region": region, "date": date_key, "context": context.kind,
         }
+
+
+# ---------------------------------------------------------------------------
+# 调度接线（D10）：background task 构建（CLI 与 Web runtime 共用）
+# ---------------------------------------------------------------------------
+
+
+def _news_digest_interval_seconds(config: Any) -> int:
+    """轮询间隔秒数；非法（0/None/非数字）回退默认 10 分钟（Scheduler 侧另有 ≥30s 钳制）。"""
+    raw = getattr(config, "news_digest_interval_minutes", None)
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        if raw is not None:
+            logger.warning(
+                "NEWS_DIGEST_INTERVAL_MINUTES=%r 非法，回退默认 %d 分钟",
+                raw, NEWS_DIGEST_DEFAULT_INTERVAL_MINUTES,
+            )
+        parsed = NEWS_DIGEST_DEFAULT_INTERVAL_MINUTES
+    else:
+        if parsed <= 0:
+            logger.warning(
+                "NEWS_DIGEST_INTERVAL_MINUTES=%r 非正，回退默认 %d 分钟",
+                raw, NEWS_DIGEST_DEFAULT_INTERVAL_MINUTES,
+            )
+            parsed = NEWS_DIGEST_DEFAULT_INTERVAL_MINUTES
+    return max(1, parsed) * 60
+
+
+def build_news_digest_background_task(
+    config_provider: Callable[[], Any],
+) -> Optional[Dict[str, Any]]:
+    """构建消息面汇总后台任务入口（D10）；disabled → None。
+
+    返回 entry ``{"task": tick, "interval_seconds": 分钟*60, "run_immediately": True,
+    "name": "news_digest"}``；``run_immediately=True`` 使进程在窗口内启动即刻补发
+    （窗口 + claim 双闸门保证不滥发）。tick 每轮经 ``config_provider`` 取最新配置，
+    并注入真实服务（W1 hand-off 要点：缺省服务会被 run_news_digest_once 的 DI
+    语义跳过，导致生产摘要恒为空模板）——共享运行时/资讯池/摘要器/数据库通道
+    任一构造失败仅记日志降级，等下一 tick 重试。
+    """
+    try:
+        config = config_provider()
+    except Exception as exc:  # noqa: BLE001 - 读不到配置按 disabled 处理
+        logger.warning("NEWS_DIGEST 读取配置失败，跳过后台任务注册: %s", exc)
+        return None
+    if not bool(getattr(config, "news_digest_enabled", False)):
+        return None
+
+    interval_seconds = _news_digest_interval_seconds(config)
+
+    def news_digest_tick() -> None:
+        try:
+            runtime_config = config_provider()
+        except Exception as exc:  # noqa: BLE001 - 本轮放弃，等下一 tick
+            logger.warning("NEWS_DIGEST tick 读取配置失败，跳过本轮: %s", exc)
+            return
+
+        notifier = None
+        search_service = None
+        try:
+            from src.core.market_review_runtime import build_market_review_runtime
+
+            notifier, _analyzer, search_service = build_market_review_runtime(runtime_config)
+        except Exception as exc:  # noqa: BLE001 - 无共享运行时：无搜索/推送腿
+            logger.warning("NEWS_DIGEST 共享运行时构造失败（搜索/推送腿降级）: %s", exc)
+
+        intelligence_service = None
+        try:
+            from src.services.intelligence_service import IntelligenceService
+
+            # 真实签名（ec66bf46）：IntelligenceService(repository=None, config=...)
+            intelligence_service = IntelligenceService(repository=None, config=runtime_config)
+        except Exception as exc:  # noqa: BLE001 - 无资讯池：池腿降级
+            logger.warning("NEWS_DIGEST 资讯池服务构造失败（池腿降级）: %s", exc)
+
+        summarizer = None
+        try:
+            summarizer = build_news_digest_llm_summarizer(runtime_config)
+        except Exception as exc:  # noqa: BLE001 - 无 LLM：模板降级
+            logger.warning("NEWS_DIGEST 摘要器构造失败（模板降级）: %s", exc)
+
+        db = None
+        try:
+            from src.storage import DatabaseManager
+
+            db = DatabaseManager.get_instance()
+        except Exception as exc:  # noqa: BLE001 - 无数据库通道：跳过落库
+            logger.warning("NEWS_DIGEST 数据库通道构造失败（跳过落库）: %s", exc)
+
+        try:
+            result = run_news_digest_once(
+                runtime_config,
+                now=datetime.now(),
+                search_service=search_service,
+                intelligence_service=intelligence_service,
+                notifier=notifier,
+                db=db,
+                summarizer=summarizer,
+            )
+        except Exception as exc:  # noqa: BLE001 - run_once 契约外兜底，绝不上抛
+            logger.error("NEWS_DIGEST tick 未预期异常（契约违反，已兜底）: %s", exc)
+            return
+        logger.info(
+            "NEWS_DIGEST tick 完成: status=%s reason=%s entries=%s search_ok=%s "
+            "feed_ok=%s summarized=%s notified=%s history_id=%s",
+            result.get("status"),
+            result.get("reason"),
+            result.get("entries_count"),
+            result.get("search_ok"),
+            result.get("feed_ok"),
+            result.get("summarized"),
+            result.get("notified"),
+            result.get("history_id"),
+        )
+
+    return {
+        "task": news_digest_tick,
+        "interval_seconds": interval_seconds,
+        "run_immediately": True,
+        "name": NEWS_DIGEST_BACKGROUND_TASK_NAME,
+    }
