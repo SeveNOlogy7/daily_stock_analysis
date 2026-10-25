@@ -625,6 +625,45 @@ def test_head_gap_manager_falls_back_to_full_network_window(tmp_path, monkeypatc
     assert len(fake.calls) == 1
 
 
+def _weekday_dates(start: date, end: date):
+    """闭区间内的工作日（周一至周五），模拟真实交易日分布。"""
+    return [
+        start + timedelta(days=i)
+        for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).weekday() < 5
+    ]
+
+
+def test_weekend_window_start_served_by_local_without_network(tmp_path, monkeypatch):
+    """起点为周六（非交易日）且文件有更早历史 → 本地正常服务，零网络调用。
+
+    OpenReview OR-COR-b1d9f608 回归：旧判定比较"窗口首条 bar 与日历起点"，
+    而 window 已滤掉起点之前的记录——base.py 默认起点按日历日推导
+    （end_date 减 days*2 个日历日），起点周期性落在周末，完整且新鲜的本地
+    数据被误判为头部缺口并强制联网（网络不可用时本可完成的获取直接失败）。
+    真实头部缺口以"文件最早 bar > 请求起点"为准（文件根本没覆盖到起点之前）。
+    """
+    fetcher = _make_fetcher(tmp_path, monkeypatch)
+    # 文件自 04-20（周一）起有数据——早于请求起点 04-25（周六）；最新 bar 06-24
+    dates = _weekday_dates(date(2026, 4, 20), date(2026, 6, 24))
+    _write_day_file(
+        tmp_path / "vipdoc" / "sh" / "lday" / "sh600519.day",
+        _records_for_dates(dates),
+    )
+
+    fake = _FullWindowNetworkFetcher(priority=1)
+    manager = DataFetcherManager([fetcher, fake])
+    df, source = manager.get_daily_data(
+        "600519", start_date="2026-04-25", end_date="2026-06-24"
+    )
+
+    assert source != "FakeFullNetworkFetcher"  # 未回退网络源
+    assert len(fake.calls) == 0
+    assert not df.empty
+    assert df["date"].iloc[0] == pd.Timestamp("2026-04-27")  # 周一首根：起点休市
+    assert len(df) == len([d for d in dates if d >= date(2026, 4, 25)])
+
+
 def test_missing_day_file_returns_empty_not_raise(tmp_path, monkeypatch):
     """代码无对应 .day 文件 → fetcher 空 df 不抛；管理器继续下一源。"""
     fetcher = _make_fetcher(tmp_path, monkeypatch)  # 树存在但不写任何 .day 文件

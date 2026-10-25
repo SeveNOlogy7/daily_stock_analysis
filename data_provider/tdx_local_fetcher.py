@@ -154,19 +154,23 @@ class TdxLocalFetcher(BaseFetcher):
             )
             return self._empty_frame()
 
-        if window["date"].iloc[0] > start_ts:
-            # D5：历史窗口头部缺口（用户中途安装 TDX、本地历史不足覆盖请求窗口）
-            # → 返回空结果回退网络源。部分数据不得以"成功"身份终止回退，否则
-            # 管理器视作成功后网络源没有机会补齐，下游对不足历史直接报错且写库
-            # 后重试无法自愈。头部完整性与尾部新鲜度（上方 max_stale_days）
-            # 同等对待；本地完全覆盖窗口时仍由本地服务（本地优先不变）。
+        # D5-b（OR-COR-b1d9f608）：真实头部缺口以"文件最早 bar > 请求起点"为准，
+        # 而非"窗口首条 bar > 起点"——window 已滤掉起点之前的记录，且 base.py 的
+        # 默认起点按日历日推导（end_date 减 days*2 个日历日），起点周期性落在
+        # 周末/节假日：文件跨越起点时窗口首条天然晚于起点，那只是起点休市，
+        # 完整本地数据仍应服务。文件最早 bar 在起点之后才是真覆盖不足（用户中途
+        # 才安装 TDX）→ 返回空结果回退网络源。部分数据不得以"成功"身份终止回退，
+        # 否则管理器视作成功后网络源没有机会补齐，下游对不足历史直接报错且写库
+        # 后重试无法自愈。头部完整性（此处）与尾部新鲜度（上方 max_stale_days）
+        # 同等对待；本地覆盖窗口时仍由本地服务（本地优先不变）。
+        file_first_ts = frame["date"].min()
+        if file_first_ts > start_ts:
             logger.warning(
                 "TdxLocalFetcher 本地数据晚于请求窗口起点（头部缺口），回退网络源: %s, "
-                "窗口起点=%s, 本地最早 bar=%s, 窗口内仅 %d 行不足以完整覆盖",
+                "窗口起点=%s, 本地最早 bar=%s",
                 stock_code,
                 start_date,
-                window["date"].iloc[0].strftime("%Y-%m-%d"),
-                len(window),
+                file_first_ts.strftime("%Y-%m-%d"),
             )
             return self._empty_frame()
 
