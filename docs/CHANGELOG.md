@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] Telegram 推送按 UTF-16 长度判断与分段，修复含大量 emoji 的报告超出 4096 限制导致发送失败的问题。
+- [新功能] 多策略综合结果新增 signal_distribution（多/中性/空阵营计数与权重占比）与 primary_dissent（确定性主要反对观点）展示契约（schema_version=strategy-synthesis-v1）；报告详情 API（同步/异步/历史）提供 report.details.strategy_synthesis 类型化投影，旧报告与畸形数据安全降级为 null；Web/桌面新增 StrategySynthesisCard 多策略共识卡片（zh/en/ko 三语，协同推演结果标注为非权威预览）。
 
 ## [3.33.0] - 2026-10-15
 
