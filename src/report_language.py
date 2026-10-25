@@ -1114,7 +1114,10 @@ def normalize_strategy_synthesis_payload(value: Any) -> Dict[str, Any]:
 
     Historical records and external callers may contain pre-contract values.
     Renderers must treat a malformed top-level payload as absent and must not
-    iterate malformed collection fields as strategy/conflict entries.
+    iterate malformed collection fields as strategy/conflict entries. The
+    issue #2071 fields (schema_version / signal_distribution /
+    primary_dissent) are sanitized the same way: non-conforming values are
+    replaced with None instead of leaking malformed structures to renderers.
     """
     if not isinstance(value, dict) or not value:
         return {}
@@ -1127,6 +1130,13 @@ def normalize_strategy_synthesis_payload(value: Any) -> Dict[str, Any]:
             if isinstance(items, list)
             else []
         )
+
+    schema_version = payload.get("schema_version")
+    payload["schema_version"] = schema_version if isinstance(schema_version, str) else None
+    distribution = payload.get("signal_distribution")
+    payload["signal_distribution"] = distribution if isinstance(distribution, dict) else None
+    dissent = payload.get("primary_dissent")
+    payload["primary_dissent"] = dissent if isinstance(dissent, dict) else None
     return payload
 
 
