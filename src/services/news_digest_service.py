@@ -1026,6 +1026,56 @@ def _news_digest_interval_seconds(config: Any) -> int:
     return max(1, parsed) * 60
 
 
+def build_news_digest_dependencies(config: Any) -> Dict[str, Any]:
+    """组装消息面汇总的真实依赖（notifier/search/intelligence/summarizer/db）。
+
+    后台 tick 与 CLI 一次性入口共用（OR-COR-000c926a）：缺省服务会被
+    ``run_news_digest_once`` 的 DI 语义跳过，导致生产摘要恒为空模板，因此
+    两条入口都必须经过本组装。每项构造失败仅记日志并置 None（fail-open
+    降级链与 build_news_digest_background_task.tick 一致），本函数按契约
+    永不向上抛。
+    """
+    notifier = None
+    search_service = None
+    try:
+        from src.core.market_review_runtime import build_market_review_runtime
+
+        notifier, _analyzer, search_service = build_market_review_runtime(config)
+    except Exception as exc:  # noqa: BLE001 - 无共享运行时：无搜索/推送腿
+        logger.warning("NEWS_DIGEST 共享运行时构造失败（搜索/推送腿降级）: %s", exc)
+
+    intelligence_service = None
+    try:
+        from src.services.intelligence_service import IntelligenceService
+
+        # 真实签名（ec66bf46）：IntelligenceService(repository=None, config=...)
+        intelligence_service = IntelligenceService(repository=None, config=config)
+    except Exception as exc:  # noqa: BLE001 - 无资讯池：池腿降级
+        logger.warning("NEWS_DIGEST 资讯池服务构造失败（池腿降级）: %s", exc)
+
+    summarizer = None
+    try:
+        summarizer = build_news_digest_llm_summarizer(config)
+    except Exception as exc:  # noqa: BLE001 - 无 LLM：模板降级
+        logger.warning("NEWS_DIGEST 摘要器构造失败（模板降级）: %s", exc)
+
+    db = None
+    try:
+        from src.storage import DatabaseManager
+
+        db = DatabaseManager.get_instance()
+    except Exception as exc:  # noqa: BLE001 - 无数据库通道：跳过落库
+        logger.warning("NEWS_DIGEST 数据库通道构造失败（跳过落库）: %s", exc)
+
+    return {
+        "notifier": notifier,
+        "search_service": search_service,
+        "intelligence_service": intelligence_service,
+        "summarizer": summarizer,
+        "db": db,
+    }
+
+
 def build_news_digest_background_task(
     config_provider: Callable[[], Any],
 ) -> Optional[Dict[str, Any]]:
@@ -1034,9 +1084,8 @@ def build_news_digest_background_task(
     返回 entry ``{"task": tick, "interval_seconds": 分钟*60, "run_immediately": True,
     "name": "news_digest"}``；``run_immediately=True`` 使进程在窗口内启动即刻补发
     （窗口 + claim 双闸门保证不滥发）。tick 每轮经 ``config_provider`` 取最新配置，
-    并注入真实服务（W1 hand-off 要点：缺省服务会被 run_news_digest_once 的 DI
-    语义跳过，导致生产摘要恒为空模板）——共享运行时/资讯池/摘要器/数据库通道
-    任一构造失败仅记日志降级，等下一 tick 重试。
+    并经 ``build_news_digest_dependencies`` 注入真实服务——共享运行时/资讯池/
+    摘要器/数据库通道任一构造失败仅记日志降级，等下一 tick 重试。
     """
     try:
         config = config_provider()
@@ -1055,47 +1104,17 @@ def build_news_digest_background_task(
             logger.warning("NEWS_DIGEST tick 读取配置失败，跳过本轮: %s", exc)
             return
 
-        notifier = None
-        search_service = None
-        try:
-            from src.core.market_review_runtime import build_market_review_runtime
-
-            notifier, _analyzer, search_service = build_market_review_runtime(runtime_config)
-        except Exception as exc:  # noqa: BLE001 - 无共享运行时：无搜索/推送腿
-            logger.warning("NEWS_DIGEST 共享运行时构造失败（搜索/推送腿降级）: %s", exc)
-
-        intelligence_service = None
-        try:
-            from src.services.intelligence_service import IntelligenceService
-
-            # 真实签名（ec66bf46）：IntelligenceService(repository=None, config=...)
-            intelligence_service = IntelligenceService(repository=None, config=runtime_config)
-        except Exception as exc:  # noqa: BLE001 - 无资讯池：池腿降级
-            logger.warning("NEWS_DIGEST 资讯池服务构造失败（池腿降级）: %s", exc)
-
-        summarizer = None
-        try:
-            summarizer = build_news_digest_llm_summarizer(runtime_config)
-        except Exception as exc:  # noqa: BLE001 - 无 LLM：模板降级
-            logger.warning("NEWS_DIGEST 摘要器构造失败（模板降级）: %s", exc)
-
-        db = None
-        try:
-            from src.storage import DatabaseManager
-
-            db = DatabaseManager.get_instance()
-        except Exception as exc:  # noqa: BLE001 - 无数据库通道：跳过落库
-            logger.warning("NEWS_DIGEST 数据库通道构造失败（跳过落库）: %s", exc)
+        deps = build_news_digest_dependencies(runtime_config)
 
         try:
             result = run_news_digest_once(
                 runtime_config,
                 now=datetime.now(),
-                search_service=search_service,
-                intelligence_service=intelligence_service,
-                notifier=notifier,
-                db=db,
-                summarizer=summarizer,
+                search_service=deps["search_service"],
+                intelligence_service=deps["intelligence_service"],
+                notifier=deps["notifier"],
+                db=deps["db"],
+                summarizer=deps["summarizer"],
             )
         except Exception as exc:  # noqa: BLE001 - run_once 契约外兜底，绝不上抛
             logger.error("NEWS_DIGEST tick 未预期异常（契约违反，已兜底）: %s", exc)

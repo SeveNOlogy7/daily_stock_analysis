@@ -1647,16 +1647,36 @@ def _append_news_digest_background_task(background_tasks, config_provider) -> No
 def _run_news_digest_once_cli(config) -> int:
     """``--news-digest`` 一次性入口（issue #2184 D11，含 critic MINOR-1）。
 
-    force=True 预览语义：跳过 enabled/窗口判定/claim 占用，但仍带 dedup_key 推送。
-    无论推送结果如何，先把生成的 Markdown 摘要打印到 stdout（dedup 吞掉通知时
-    CLI 不得表现为"无事发生"），再输出推送状态行。
+    与后台 tick 共用同一依赖组装（build_news_digest_dependencies，issue #2184
+    OR-COR-000c926a）：真实抓取搜索/资讯池并调 LLM，任一构造失败按链条降级并
+    记日志，绝不裸抛。force=True 预览语义：跳过 enabled/窗口判定与"已推送即
+    跳过"短路，但同日至多推送一次的持久化 claim 保证不绕过（OR-COR-860c1e1a）
+    ——当日已推送过则只生成/打印内容，不重发。
+    无论推送结果如何，先把生成的 Markdown 摘要打印到 stdout，再输出推送状态行。
     """
     from datetime import datetime
 
-    from src.services.news_digest_service import run_news_digest_once
+    from src.services.news_digest_service import (
+        build_news_digest_dependencies,
+        run_news_digest_once,
+    )
 
-    logger.info("模式: 仅消息面汇总（--news-digest，force 预览）")
-    result = run_news_digest_once(config, now=datetime.now(), force=True)
+    logger.info("模式: 仅消息面汇总（--news-digest）")
+    try:
+        deps = build_news_digest_dependencies(config)
+    except Exception as exc:  # 双保险：组装器契约是不抛，这里仍兜底全量降级
+        logger.warning("消息面汇总依赖组装意外失败（全量降级为空来源/模板）: %s", exc)
+        deps = {}
+    result = run_news_digest_once(
+        config,
+        now=datetime.now(),
+        search_service=deps.get("search_service"),
+        intelligence_service=deps.get("intelligence_service"),
+        notifier=deps.get("notifier"),
+        db=deps.get("db"),
+        summarizer=deps.get("summarizer"),
+        force=True,
+    )
 
     report = ""
     status = "unknown"

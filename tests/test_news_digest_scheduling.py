@@ -260,8 +260,18 @@ def test_main_background_tasks_build_failure_never_raises():
     assert tasks == []
 
 
+_EMPTY_DEPS = {
+    "notifier": None,
+    "search_service": None,
+    "intelligence_service": None,
+    "summarizer": None,
+    "db": None,
+}
+
+
 def test_cli_news_digest_invokes_service_force(capsys):
-    """--news-digest：force=True（跳过窗口判定）+ Markdown 摘要打印到 stdout（D11/MINOR-1）。"""
+    """--news-digest：force=True（跳过窗口/已推送短路）+ Markdown 摘要打印到
+    stdout（D11/MINOR-1）；依赖组装链路另有集成用例覆盖。"""
     report_markdown = "# 消息面汇总（盘前）2026-10-25\n\n正文"
     fake_result = {
         "status": "success",
@@ -271,6 +281,9 @@ def test_cli_news_digest_invokes_service_force(capsys):
         "report": report_markdown,
     }
     with patch(
+        "src.services.news_digest_service.build_news_digest_dependencies",
+        return_value=dict(_EMPTY_DEPS),
+    ), patch(
         "src.services.news_digest_service.run_news_digest_once",
         return_value=fake_result,
     ) as run_mock:
@@ -291,12 +304,184 @@ def test_cli_news_digest_invokes_service_force(capsys):
 def test_cli_news_digest_failed_reports_nonzero(monkeypatch, capsys):
     fake_result = {"status": "failed", "reason": "unexpected_error: Boom", "report": ""}
     with patch(
+        "src.services.news_digest_service.build_news_digest_dependencies",
+        return_value=dict(_EMPTY_DEPS),
+    ), patch(
         "src.services.news_digest_service.run_news_digest_once",
         return_value=fake_result,
     ):
         exit_code = main._run_news_digest_once_cli(SimpleNamespace())
     assert exit_code == 1
     assert "failed" in capsys.readouterr().out
+
+
+def test_cli_news_digest_dependency_assembly_failure_never_raises(capsys):
+    """组装器意外抛异常：CLI 兜底全量降级（空依赖），仍完成运行并打印状态。"""
+    fake_result = {"status": "success", "reason": None, "notified": True, "report": "# 摘要"}
+    with patch(
+        "src.services.news_digest_service.build_news_digest_dependencies",
+        side_effect=RuntimeError("assembly exploded"),
+    ), patch(
+        "src.services.news_digest_service.run_news_digest_once",
+        return_value=fake_result,
+    ) as run_mock:
+        exit_code = main._run_news_digest_once_cli(SimpleNamespace())
+
+    assert exit_code == 0
+    _args, kwargs = run_mock.call_args
+    assert kwargs.get("search_service") is None
+    assert kwargs.get("notifier") is None
+    assert "# 摘要" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# CLI 真实依赖组装（OR-COR-000c926a：--news-digest 不得恒生成无数据模板）
+# ---------------------------------------------------------------------------
+
+
+class _RecordingNotifier:
+    def __init__(self):
+        self.calls = []
+
+    def send(self, content, **kwargs):
+        self.calls.append(dict(kwargs, content=content))
+        return True
+
+
+class _RecordingSearch:
+    is_available = True
+
+    def __init__(self):
+        self.calls = []
+
+    def search_topic_news_bounded(self, topic, max_results=5, **kwargs):
+        self.calls.append(topic)
+
+        class _Item:
+            title = f"{topic}要闻"
+            snippet = "盘前快讯正文"
+            url = f"https://news.cn/{topic}"
+            source = "新华社"
+            published_date = None
+
+        class _Response:
+            success = True
+            results = [_Item()]
+
+        return _Response()
+
+
+class _RecordingIntelligence:
+    def __init__(self):
+        self.fetch_called = False
+        self.repo = SimpleNamespace(list_items=self._list_items)
+
+    def fetch_enabled_sources(self):
+        self.fetch_called = True
+        return {"ok": True, "source_count": 0, "results": [], "saved_count": 0}
+
+    def _list_items(self, **kwargs):
+        return [], 0
+
+
+class _RecordingDb:
+    def __init__(self):
+        self.saved = []
+
+    def save_analysis_history(self, **kwargs):
+        self.saved.append(kwargs)
+        return 77
+
+
+def test_cli_news_digest_assembles_real_dependencies(tmp_path, capsys):
+    """--news-digest 集成路径：CLI 必须组装真实依赖并注入服务（不 mock
+    run_news_digest_once），否则生产输出恒为无数据模板（OR-COR-000c926a）。"""
+    digest_notifier = _RecordingNotifier()
+    digest_search = _RecordingSearch()
+    digest_intelligence = _RecordingIntelligence()
+    digest_db = _RecordingDb()
+    config = SimpleNamespace(
+        news_digest_enabled=True,
+        news_digest_premarket_window="08:00-09:15",
+        news_digest_offday_window="09:00-18:00",
+        news_digest_topics="宏观政策",
+        news_digest_region="cn",
+        report_language="zh",
+        database_path=str(tmp_path / "cli_digest.db"),
+    )
+
+    with patch(
+        "src.core.market_review_runtime.build_market_review_runtime",
+        return_value=(digest_notifier, None, digest_search),
+    ) as runtime_mock, patch(
+        "src.services.intelligence_service.IntelligenceService",
+        return_value=digest_intelligence,
+    ), patch(
+        "src.storage.DatabaseManager"
+    ) as database_manager_cls, patch(
+        "src.notification.NotificationService"
+    ) as fallback_notifier_cls:
+        database_manager_cls.get_instance.return_value = digest_db
+        exit_code = main._run_news_digest_once_cli(config)
+
+    assert runtime_mock.call_count >= 1
+    assert exit_code == 0
+    assert digest_search.calls, "搜索腿依赖未组装：CLI 未向服务传入 search_service"
+    assert digest_intelligence.fetch_called, "资讯池依赖未组装：CLI 未传入 intelligence_service"
+    assert len(digest_notifier.calls) == 1, (
+        "通知依赖未组装：发送走了服务内 NotificationService 回退构造"
+    )
+    assert fallback_notifier_cls.call_count == 0, (
+        "notifier 应由 CLI 组装注入，而非触发服务内回退构造"
+    )
+    assert len(digest_db.saved) == 1
+    captured = capsys.readouterr().out
+    assert "# 消息面汇总" in captured
+    assert "盘前快讯正文" in captured, "真实搜索结果应进入最终摘要而非空模板"
+
+
+def test_build_news_digest_dependencies_fail_open():
+    """共享组装器契约：任一依赖构造失败仅降级 None，绝不向上抛。"""
+    with patch(
+        "src.core.market_review_runtime.build_market_review_runtime",
+        side_effect=RuntimeError("runtime down"),
+    ), patch(
+        "src.services.intelligence_service.IntelligenceService",
+        side_effect=RuntimeError("repo down"),
+    ), patch(
+        "src.storage.DatabaseManager"
+    ) as database_manager_cls:
+        database_manager_cls.get_instance.side_effect = RuntimeError("db down")
+        deps = news_digest_service.build_news_digest_dependencies(SimpleNamespace())
+    assert deps == {
+        "notifier": None,
+        "search_service": None,
+        "intelligence_service": None,
+        "summarizer": None,
+        "db": None,
+    }
+
+
+def test_build_news_digest_dependencies_assembles_all():
+    """共享组装器正常路径：四类依赖全部组装到位（tick 与 CLI 共用）。"""
+    sentinel_notifier, sentinel_search = object(), object()
+    sentinel_intelligence, sentinel_db = object(), object()
+    with patch(
+        "src.core.market_review_runtime.build_market_review_runtime",
+        return_value=(sentinel_notifier, object(), sentinel_search),
+    ), patch(
+        "src.services.intelligence_service.IntelligenceService",
+        return_value=sentinel_intelligence,
+    ), patch(
+        "src.storage.DatabaseManager"
+    ) as database_manager_cls:
+        database_manager_cls.get_instance.return_value = sentinel_db
+        deps = news_digest_service.build_news_digest_dependencies(SimpleNamespace())
+    assert deps["notifier"] is sentinel_notifier
+    assert deps["search_service"] is sentinel_search
+    assert deps["intelligence_service"] is sentinel_intelligence
+    assert deps["db"] is sentinel_db
+    assert callable(deps["summarizer"])
 
 
 # ---------------------------------------------------------------------------
