@@ -631,12 +631,20 @@ def _handle_sync_analysis(
             fallback_raw_result_payload=raw_result_snapshot or result,
         )
 
+        # Issue #1910 meta passthrough: sync responses must carry the same
+        # report.meta.cross_asset_context_summary as the /status and history
+        # paths (PR #2428 review). Fail-open helper: legacy/degraded snapshots
+        # leave the report dict untouched.
+        report_dict = report.model_dump() if report else None
+        if report_dict is not None:
+            _attach_cross_asset_summary_to_report_meta(report_dict, context_snapshot)
+
         return AnalysisResultResponse(
             query_id=query_id,
             trace_id=result.get("trace_id") or query_id,
             stock_code=result.get("stock_code", stock_code),
             stock_name=result.get("stock_name"),
-            report=report.model_dump() if report else None,
+            report=report_dict,
             diagnostic_summary=result.get("diagnostic_summary"),
             created_at=datetime.now().isoformat()
         )
