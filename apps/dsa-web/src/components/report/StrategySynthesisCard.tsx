@@ -27,15 +27,28 @@ const toRecord = (value: unknown): Record<string, unknown> | null =>
     ? (value as Record<string, unknown>)
     : null;
 
-const formatPercent = (value: number | null | undefined): string =>
-  value == null ? '—' : `${(value * 100).toFixed(1)}%`;
+// Degraded display (issue #2071 review fix OR-COR-12e5b2ef): the backend keeps
+// conflicts/revisionProjection as Dict[str, Any], so a legacy/malformed record
+// can carry nested objects where these helpers promise strings/numbers. Every
+// formatter therefore guards on typeof first and falls back to a placeholder —
+// a malformed field degrades on its own instead of crashing the card.
+const toText = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() !== '' ? value : null;
 
-const formatScore = (value: number | null | undefined): string =>
-  value == null ? '—' : value.toFixed(2);
+const formatPercent = (value: unknown): string => {
+  const numeric = toNumber(value);
+  return numeric == null ? '—' : `${(numeric * 100).toFixed(1)}%`;
+};
 
-const normalizeSignal = (signal?: string | null): string => (signal || '').trim().toLowerCase();
+const formatScore = (value: unknown): string => {
+  const numeric = toNumber(value);
+  return numeric == null ? '—' : numeric.toFixed(2);
+};
 
-const getSignalLabel = (signal: string | null | undefined, text: ReportText): string => {
+const normalizeSignal = (signal: unknown): string =>
+  typeof signal === 'string' ? signal.trim().toLowerCase() : '';
+
+const getSignalLabel = (signal: unknown, text: ReportText): string => {
   switch (normalizeSignal(signal)) {
     case 'strong_buy':
       return text.signalStrongBuy;
@@ -48,13 +61,13 @@ const getSignalLabel = (signal: string | null | undefined, text: ReportText): st
     case 'hold':
       return text.signalHold;
     default:
-      return signal || '—';
+      return toText(signal) || '—';
   }
 };
 
 type SignalVariant = 'success' | 'danger' | 'default';
 
-const getSignalVariant = (signal?: string | null): SignalVariant => {
+const getSignalVariant = (signal?: unknown): SignalVariant => {
   const normalized = normalizeSignal(signal);
   if (normalized === 'buy' || normalized === 'strong_buy') {
     return 'success';
@@ -65,7 +78,7 @@ const getSignalVariant = (signal?: string | null): SignalVariant => {
   return 'default';
 };
 
-const getConsensusLabel = (level: string | null | undefined, text: ReportText): string => {
+const getConsensusLabel = (level: unknown, text: ReportText): string => {
   switch (level) {
     case 'high':
       return text.consensusHigh;
@@ -76,13 +89,13 @@ const getConsensusLabel = (level: string | null | undefined, text: ReportText): 
     case 'insufficient':
       return text.consensusInsufficient;
     default:
-      return level || '—';
+      return toText(level) || '—';
   }
 };
 
 type ConsensusVariant = 'success' | 'info' | 'warning' | 'default';
 
-const getConsensusVariant = (level?: string | null): ConsensusVariant => {
+const getConsensusVariant = (level?: unknown): ConsensusVariant => {
   switch (level) {
     case 'high':
       return 'success';
@@ -95,7 +108,7 @@ const getConsensusVariant = (level?: string | null): ConsensusVariant => {
   }
 };
 
-const getSeverityLabel = (severity: string | null | undefined, text: ReportText): string => {
+const getSeverityLabel = (severity: unknown, text: ReportText): string => {
   switch (severity) {
     case 'none':
       return text.conflictSeverityNone;
@@ -106,13 +119,13 @@ const getSeverityLabel = (severity: string | null | undefined, text: ReportText)
     case 'high':
       return text.conflictSeverityHigh;
     default:
-      return severity || '—';
+      return toText(severity) || '—';
   }
 };
 
 type SeverityVariant = 'default' | 'info' | 'warning' | 'danger';
 
-const getSeverityVariant = (severity?: string | null): SeverityVariant => {
+const getSeverityVariant = (severity?: unknown): SeverityVariant => {
   switch (severity) {
     case 'low':
       return 'info';
@@ -135,27 +148,30 @@ const MetricLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div className="text-[11px] uppercase tracking-wide text-muted-text">{children}</div>
 );
 
-const SkillEntryRow: React.FC<{ entry: StrategySynthesisSkillEntry; text: ReportText }> = ({ entry, text }) => (
-  <li className="rounded-lg border border-border/30 bg-elevated/30 p-3 text-sm">
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="font-mono text-xs text-secondary-text">
-        {entry.agentName || entry.skillId || '—'}
-      </span>
-      <Badge variant={getSignalVariant(entry.signal)} className="shadow-none">
-        {getSignalLabel(entry.signal, text)}
-      </Badge>
-      {entry.confidence != null && (
-        <span className="font-mono text-xs text-muted-text">{formatPercent(entry.confidence)}</span>
-      )}
-    </div>
-    {entry.reasoning ? (
-      <p className="mt-1 text-xs leading-5 text-secondary-text">
-        <span className="text-muted-text">{text.strategySynthesisReasoning}: </span>
-        {entry.reasoning}
-      </p>
-    ) : null}
-  </li>
-);
+const SkillEntryRow: React.FC<{ entry: StrategySynthesisSkillEntry; text: ReportText }> = ({ entry, text }) => {
+  const agentLabel = toText(entry.agentName) || toText(entry.skillId) || '—';
+  const confidence = toNumber(entry.confidence);
+  const reasoning = toText(entry.reasoning);
+  return (
+    <li className="rounded-lg border border-border/30 bg-elevated/30 p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs text-secondary-text">{agentLabel}</span>
+        <Badge variant={getSignalVariant(entry.signal)} className="shadow-none">
+          {getSignalLabel(entry.signal, text)}
+        </Badge>
+        {confidence != null && (
+          <span className="font-mono text-xs text-muted-text">{formatPercent(confidence)}</span>
+        )}
+      </div>
+      {reasoning ? (
+        <p className="mt-1 text-xs leading-5 text-secondary-text">
+          <span className="text-muted-text">{text.strategySynthesisReasoning}: </span>
+          {reasoning}
+        </p>
+      ) : null}
+    </li>
+  );
+};
 
 /**
  * 多策略综合卡片（issue #2071）。
@@ -209,10 +225,13 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
   const supportingSkills = Array.isArray(synthesis.supportingSkills) ? synthesis.supportingSkills : [];
   const opposingSkills = Array.isArray(synthesis.opposingSkills) ? synthesis.opposingSkills : [];
   const conflicts = Array.isArray(synthesis.conflicts) ? synthesis.conflicts : [];
-  const dissent = synthesis.primaryDissent;
-  const revision = synthesis.revisionProjection;
+  const dissent = toRecord(synthesis.primaryDissent);
+  const revision = toRecord(synthesis.revisionProjection);
   const deliberationRecord = toRecord(synthesis.deliberation);
   const deliberationSummary = toRecord(deliberationRecord?.summary);
+  const originalConfidence = toNumber(synthesis.originalConfidence);
+  const conflictCount = toNumber(synthesis.conflictCount);
+  const conflictSeverity = toText(synthesis.conflictSeverity);
 
   return (
     <Card variant="bordered" padding="md" className="home-panel-card">
@@ -242,9 +261,9 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
             <MetricLabel>
               {text.strategySynthesisConfidence}: {formatPercent(synthesis.confidence)}
             </MetricLabel>
-            {synthesis.originalConfidence != null && (
+            {originalConfidence != null && (
               <div className="mt-1 font-mono text-xs text-muted-text">
-                {text.strategySynthesisOriginalConfidence}: {formatPercent(synthesis.originalConfidence)}
+                {text.strategySynthesisOriginalConfidence}: {formatPercent(originalConfidence)}
               </div>
             )}
           </MetricCell>
@@ -258,12 +277,12 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
           </MetricCell>
         </div>
 
-        {synthesis.conflictCount != null && (
+        {conflictCount != null && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
-            <span className="text-secondary-text">{text.strategySynthesisConflicts}: {synthesis.conflictCount}</span>
-            {synthesis.conflictSeverity && (
-              <Badge variant={getSeverityVariant(synthesis.conflictSeverity)} className="shadow-none">
-                {getSeverityLabel(synthesis.conflictSeverity, text)}
+            <span className="text-secondary-text">{text.strategySynthesisConflicts}: {conflictCount}</span>
+            {conflictSeverity && (
+              <Badge variant={getSeverityVariant(conflictSeverity)} className="shadow-none">
+                {getSeverityLabel(conflictSeverity, text)}
               </Badge>
             )}
           </div>
@@ -349,18 +368,18 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
                   <div className="mt-2 rounded-lg border border-border/30 bg-elevated/30 p-3 text-sm">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-xs text-secondary-text">
-                        {dissent.agentName || dissent.skillId || '—'}
+                        {toText(dissent.agentName) || toText(dissent.skillId) || '—'}
                       </span>
                       <Badge variant={getSignalVariant(dissent.signal)} className="shadow-none">
                         {getSignalLabel(dissent.signal, text)}
                       </Badge>
-                      {dissent.confidence != null && (
+                      {toNumber(dissent.confidence) != null && (
                         <span className="font-mono text-xs text-muted-text">
                           {formatPercent(dissent.confidence)}
                         </span>
                       )}
                     </div>
-                    {dissent.reasoning ? (
+                    {toText(dissent.reasoning) ? (
                       <>
                         <p
                           className={`mt-1 text-xs leading-5 text-secondary-text ${
@@ -368,7 +387,7 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
                           }`}
                         >
                           <span className="text-muted-text">{text.strategySynthesisReasoning}: </span>
-                          {dissent.reasoning}
+                          {toText(dissent.reasoning)}
                         </p>
                         <button
                           type="button"
@@ -393,22 +412,26 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
                   <span className="label-uppercase">{text.strategySynthesisConflictDetails}</span>
                   <ul className="mt-2 space-y-2">
                     {conflicts.map((conflict, index) => {
-                      const participants = toTextList(conflict?.participants);
+                      const record = toRecord(conflict);
+                      const conflictType = toText(record?.conflictType);
+                      const severity = toText(record?.severity);
+                      const descriptionKey = toText(record?.descriptionKey);
+                      const participants = toTextList(record?.participants);
                       return (
                         <li
-                          key={`${conflict?.conflictType || 'conflict'}-${index}`}
+                          key={`${conflictType || 'conflict'}-${index}`}
                           className="rounded-lg border border-border/30 bg-elevated/30 p-3 text-sm"
                         >
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge
-                              variant={getSeverityVariant(conflict?.severity)}
+                              variant={getSeverityVariant(severity)}
                               className="shadow-none"
                             >
-                              {getSeverityLabel(conflict?.severity, text)}
+                              {getSeverityLabel(severity, text)}
                             </Badge>
-                            {conflict?.descriptionKey && (
+                            {descriptionKey && (
                               <span className="font-mono text-xs text-secondary-text">
-                                {conflict.descriptionKey}
+                                {descriptionKey}
                               </span>
                             )}
                           </div>
@@ -453,7 +476,7 @@ export const StrategySynthesisCard: React.FC<StrategySynthesisCardProps> = ({
                         {getSignalLabel(revision.projectedSignal, text)}
                       </Badge>
                     </span>
-                    {revision.projectedConfidence != null && (
+                    {toNumber(revision.projectedConfidence) != null && (
                       <span className="inline-flex items-center gap-1.5 font-mono text-xs text-muted-text">
                         <span className="font-sans text-secondary-text">
                           {text.strategySynthesisProjectedConfidence}

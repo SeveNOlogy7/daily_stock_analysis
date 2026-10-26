@@ -811,6 +811,72 @@ class StrategySynthesisApiProjectionTestCase(unittest.TestCase):
         self.assertIsNone(dumped_c3["primary_dissent"])
         self.assertEqual(dumped_c3["final_signal"], "hold")
 
+    def test_5b_nested_revision_and_conflict_fields_degrade_to_null(self) -> None:
+        """OR-COR-12e5b2ef / OR-COR-4b4fdbb2: nested display fields are type-guarded.
+
+        A malformed ``revision_projection.projected_signal`` (object instead of
+        string) and malformed conflict-entry fields (``severity`` /
+        ``description_key`` objects, non-list ``participants``) must project to
+        ``None`` so the Web card degrades field by field instead of crashing on
+        render. Sibling well-formed values and the rest of the payload stay
+        intact; the schema keeps ``Dict[str, Any]`` declarations (values are
+        sanitized, not reshaped).
+        """
+        if _build_analysis_report is None:
+            self.skipTest("projection helpers unavailable in this environment")
+
+        payload = _v1_synthesis_payload()
+        payload["revision_projection"] = {
+            "status": "computed",
+            "mode": "preview_only",
+            "projected_signal": {"bad": "buy"},
+            "projected_confidence": "high",
+            "projected_conflict_count": "two",
+            "final_signal_overridden": "no",
+        }
+        payload["conflicts"] = [
+            {
+                "conflict_type": {"kind": "direction"},
+                "severity": {"level": "high"},
+                "description_key": ["strategy_conflict.directional_opposition"],
+                "participants": "skill_hold,skill_buy",
+                "metadata": {"keep": "me"},
+            },
+            "junk-entry",
+            42,
+        ]
+
+        details_1 = self._details_via_sync_report(_raw_result_with(payload))
+        syn = getattr(details_1, "strategy_synthesis", None)
+        self.assertIsNotNone(syn, "malformed nested fields must not void the payload")
+        dumped = details_1.model_dump()["strategy_synthesis"]
+
+        revision = dumped["revision_projection"]
+        self.assertIsNotNone(
+            revision, "malformed nested fields must not void the preview block"
+        )
+        self.assertIsNone(revision["projected_signal"])
+        self.assertIsNone(revision["projected_confidence"])
+        self.assertIsNone(revision["projected_conflict_count"])
+        self.assertIsNone(revision["final_signal_overridden"])
+        self.assertEqual(revision["status"], "computed")
+        self.assertEqual(revision["mode"], "preview_only")
+
+        conflicts = dumped["conflicts"]
+        self.assertEqual(len(conflicts), 1, "non-dict conflict entries must be filtered")
+        conflict = conflicts[0]
+        self.assertIsNone(conflict["conflict_type"])
+        self.assertIsNone(conflict["severity"])
+        self.assertIsNone(conflict["description_key"])
+        self.assertIsNone(conflict["participants"])
+        self.assertEqual(conflict["metadata"], {"keep": "me"})
+
+        # Well-formed sibling payload fields stay intact and the JSON surface
+        # serializes the sanitized nulls without raising.
+        self.assertEqual(dumped["final_signal"], "hold")
+        self.assertEqual(dumped["confidence"], 0.6517)
+        details_1.model_dump_json()
+
     # ------------------------------------------------------------------
     # Point 6: raw_result is preserved untouched
     # ------------------------------------------------------------------

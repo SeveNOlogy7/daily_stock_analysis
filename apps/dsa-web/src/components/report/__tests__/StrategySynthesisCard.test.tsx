@@ -308,6 +308,86 @@ describe('StrategySynthesisCard', () => {
   });
 });
 
+describe('StrategySynthesisCard malformed-input degradation (OR-COR-12e5b2ef)', () => {
+  // The API layer keeps conflicts/revisionProjection as Dict[str, Any], so a
+  // legacy/malformed record can carry nested objects where the camelCase types
+  // promise strings/numbers. The card must degrade per field instead of
+  // throwing during render (normalizeSignal .trim() / invalid React children).
+  const malformedSynthesis = {
+    ...fullSynthesis,
+    finalSignal: { bad: 'hold' },
+    weightedScore: { value: 3.45 },
+    consensusLevel: { level: 'medium' },
+    conflictCount: { n: 1 },
+    conflictSeverity: { level: 'medium' },
+    supportingSkills: [
+      {
+        skillId: 'skill_hold',
+        agentName: { name: 'strategy_hold' },
+        signal: { bad: 'hold' },
+        confidence: 'high',
+        reasoning: { text: '区间震荡' },
+      },
+    ],
+    opposingSkills: ['junk-entry'],
+    primaryDissent: {
+      skillId: 'skill_buy',
+      agentName: { name: 'strategy_buy' },
+      signal: { bad: 'buy' },
+      confidence: { value: 0.9 },
+      reasoning: { text: '突破形态成立' },
+    },
+    conflicts: [
+      {
+        conflictType: { kind: 'direction' },
+        severity: { level: 'high' },
+        descriptionKey: ['strategy_conflict.directional_opposition'],
+        participants: 'skill_sell,skill_buy',
+        metadata: {},
+      },
+      'junk-entry',
+    ],
+    revisionProjection: {
+      status: 'preview',
+      mode: 'softened',
+      projectedSignal: { bad: 'buy' },
+      projectedConfidence: { value: 0.8 },
+      finalSignalOverridden: false,
+    },
+  } as unknown as StrategySynthesis;
+
+  it('degrades field by field instead of throwing when nested fields are objects', () => {
+    render(<StrategySynthesisCard synthesis={malformedSynthesis} />);
+    expandCard();
+
+    // The card and its expandable sections survive malformed nested values.
+    expect(screen.getByTestId('strategy-synthesis-card')).toBeInTheDocument();
+    expect(screen.getByText('冲突明细')).toBeInTheDocument();
+    const preview = screen.getByTestId('synthesis-revision-preview');
+    expect(within(preview).getByText('非权威预览')).toBeInTheDocument();
+
+    // The malformed projectedSignal degrades to the placeholder badge.
+    expect(within(preview).getByText('—')).toBeInTheDocument();
+
+    // No malformed value may leak into the DOM as "[object Object]".
+    expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument();
+  });
+
+  it('renders malformed conflict entries with placeholder severity and no description key', () => {
+    render(<StrategySynthesisCard synthesis={malformedSynthesis} />);
+    expandCard();
+
+    const card = screen.getByTestId('strategy-synthesis-card');
+    // severity object -> placeholder severity badge...
+    expect(within(card).getAllByText('—').length).toBeGreaterThan(0);
+    // ...and the descriptionKey array must not render as an invalid child.
+    expect(
+      within(card).queryByText(/strategy_conflict\.directional_opposition/),
+    ).not.toBeInTheDocument();
+    expect(within(card).queryByText(/\[object Object\]/)).not.toBeInTheDocument();
+  });
+});
+
 describe('ReportSummary strategy synthesis placement', () => {
   beforeEach(() => {
     vi.clearAllMocks();

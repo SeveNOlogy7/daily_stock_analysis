@@ -1245,6 +1245,90 @@ def _synthesis_primary_dissent(value: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _synthesis_string_list(value: Any) -> Optional[List[str]]:
+    """Keep only the string members of a list; any other shape degrades to None."""
+    if not isinstance(value, list):
+        return None
+    return [entry for entry in value if isinstance(entry, str)]
+
+
+def _synthesis_conflict_entries(value: Any) -> List[Dict[str, Any]]:
+    """Sanitize conflict entries field by field for the typed projection.
+
+    Issue #2071 review fix (OR-COR-12e5b2ef): conflicts used to pass through
+    with only a non-dict filter, so a malformed entry field (e.g. ``severity``
+    as an object, ``description_key`` as a list) reached the Web card and
+    broke rendering as an invalid React child. Display fields are now
+    type-guarded in place — a malformed value becomes ``None`` (JSON
+    ``null``) while the rest of the entry, its unknown keys and its
+    well-formed sibling fields stay intact. The Pydantic declaration remains
+    ``List[Dict[str, Any]]`` (values are sanitized, not reshaped).
+    """
+    if not isinstance(value, list):
+        return []
+    entries: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        if "conflict_type" in entry:
+            entry["conflict_type"] = _synthesis_optional_str(entry["conflict_type"])
+        if "severity" in entry:
+            entry["severity"] = _synthesis_optional_str(entry["severity"])
+        if "description_key" in entry:
+            entry["description_key"] = _synthesis_optional_str(entry["description_key"])
+        if "participants" in entry:
+            entry["participants"] = _synthesis_string_list(entry["participants"])
+        if "metadata" in entry and not isinstance(entry["metadata"], dict):
+            entry["metadata"] = None
+        entries.append(entry)
+    return entries
+
+
+def _synthesis_revision_projection(value: Any) -> Optional[Dict[str, Any]]:
+    """Sanitize the revision-preview block field by field for the typed projection.
+
+    Issue #2071 review fix (OR-COR-12e5b2ef): the preview dict used to be
+    shallow-copied verbatim, so a malformed ``projected_signal`` (an object
+    instead of a string) reached the Web card and crashed
+    ``normalizeSignal``. Every contract display field is type-guarded here: a
+    malformed value becomes ``None`` (JSON ``null``) while well-formed
+    sibling fields — and unknown keys — are preserved untouched. The Pydantic
+    declaration remains ``Optional[Dict[str, Any]]`` (values are sanitized,
+    not reshaped).
+    """
+    if not isinstance(value, dict):
+        return None
+    projected = dict(value)
+    for key in (
+        "status",
+        "mode",
+        "source_mode",
+        "projected_signal",
+        "projected_conflict_severity",
+        "projected_consensus_level",
+    ):
+        if key in projected:
+            projected[key] = _synthesis_optional_str(projected[key])
+    for key in (
+        "projected_weighted_score",
+        "projected_confidence",
+        "projected_original_confidence",
+    ):
+        if key in projected:
+            projected[key] = _synthesis_optional_float(projected[key])
+    for key in ("projected_conflict_count", "changed_skill_count"):
+        if key in projected:
+            projected[key] = _synthesis_optional_int(projected[key])
+    if "changed_skills" in projected:
+        projected["changed_skills"] = _synthesis_string_list(projected["changed_skills"])
+    if "final_signal_overridden" in projected and not isinstance(
+        projected["final_signal_overridden"], bool
+    ):
+        projected["final_signal_overridden"] = None
+    return projected
+
+
 def project_strategy_synthesis_for_details(raw_result: Any) -> Optional[Dict[str, Any]]:
     """Typed low-sensitivity projection for ``report.details.strategy_synthesis``.
 
@@ -1293,15 +1377,9 @@ def project_strategy_synthesis_for_details(raw_result: Any) -> Optional[Dict[str
         "supporting_skills": _synthesis_skill_entries(payload.get("supporting_skills")),
         "opposing_skills": _synthesis_skill_entries(payload.get("opposing_skills")),
         "primary_dissent": _synthesis_primary_dissent(payload.get("primary_dissent")),
-        "conflicts": (
-            [item for item in conflicts if isinstance(item, dict)]
-            if isinstance(conflicts, list)
-            else []
-        ),
+        "conflicts": _synthesis_conflict_entries(conflicts),
         "deliberation": dict(deliberation) if isinstance(deliberation, dict) else None,
-        "revision_projection": (
-            dict(revision_projection) if isinstance(revision_projection, dict) else None
-        ),
+        "revision_projection": _synthesis_revision_projection(revision_projection),
     }
 
 
