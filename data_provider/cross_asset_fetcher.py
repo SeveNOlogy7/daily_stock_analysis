@@ -75,7 +75,7 @@ _CN_YF_BEST_EFFORT_INDICES: Dict[str, Tuple[str, str]] = {
 
 _GLOBAL_SYMBOLS: Dict[str, Dict[str, Tuple[str, str]]] = {
     "volatility": {"VIX": ("^VIX", "VIX恐慌指数")},
-    "rates": {"US10Y": ("^TNX", "美债10年期收益率")},  # ^TNX quotes yield*10; normalized /10 below
+    "rates": {"US10Y": ("^TNX", "美债10年期收益率")},  # ^TNX Close is already a percent yield; no scaling
     "commodities": {
         "GOLD": ("GC=F", "COMEX黄金"),
         "WTI": ("CL=F", "WTI原油"),
