@@ -103,8 +103,9 @@ SKILL_ENTRY_FIELDS = (
 DISSENT_FIELDS = ("skill_id", "agent_name", "signal", "confidence", "reasoning")
 
 # Snapshot of create_app().openapi()["paths"] at the W2 baseline
-# (branch feat/strategy-synthesis-2071, HEAD e864f3cc). The typed projection
-# must not add or remove any API path.
+# (branch feat/strategy-synthesis-2071, HEAD e864f3cc), re-aligned with
+# upstream main 4e622643 (see UPSTREAM_RETIRED_OPENAPI_PATHS below). The
+# typed projection must not add or remove any API path.
 BASELINE_OPENAPI_PATHS = frozenset({
     "/api/health",
     "/api/v1/agent/chat",
@@ -112,7 +113,6 @@ BASELINE_OPENAPI_PATHS = frozenset({
     "/api/v1/agent/chat/sessions",
     "/api/v1/agent/chat/sessions/{session_id}",
     "/api/v1/agent/chat/stream",
-    "/api/v1/agent/chat/stream/{request_id}/cancel",
     "/api/v1/agent/models",
     "/api/v1/agent/research",
     "/api/v1/agent/skills",
@@ -224,6 +224,15 @@ BASELINE_OPENAPI_PATHS = frozenset({
     "/api/v1/usage/dashboard",
     "/api/v1/usage/summary",
     "/health",
+})
+
+# Upstream commit 88ec4bae (PR #2422) retired the Codex App Server
+# cancellation endpoint, so create_app() exposes it only while the branch
+# predates that merge. The path is filtered out of the observed route set
+# before the invariant check instead of being pinned to either side of the
+# merge; every other path must match the baseline exactly.
+UPSTREAM_RETIRED_OPENAPI_PATHS = frozenset({
+    "/api/v1/agent/chat/stream/{request_id}/cancel",
 })
 
 
@@ -908,7 +917,9 @@ class StrategySynthesisApiProjectionTestCase(unittest.TestCase):
         if create_app is None:
             self.skipTest("fastapi is not installed in this test environment")
 
-        paths = set(create_app().openapi()["paths"])
+        paths = (
+            set(create_app().openapi()["paths"]) - UPSTREAM_RETIRED_OPENAPI_PATHS
+        )
         self.assertEqual(
             paths,
             BASELINE_OPENAPI_PATHS,
