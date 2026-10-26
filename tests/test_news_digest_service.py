@@ -108,12 +108,15 @@ class StubIntelligenceService:
 
 
 class StubNotifier:
-    def __init__(self):
+    """send 可配置成功/失败的记录桩：send_result=False 模拟所有渠道失败。"""
+
+    def __init__(self, send_result=True):
+        self.send_result = send_result
         self.calls = []
 
     def send(self, content, **kwargs):
         self.calls.append(dict(kwargs, content=content))
-        return True
+        return self.send_result
 
 
 class StubDb:
@@ -738,3 +741,127 @@ def test_run_once_report_contains_freshness_footer(tmp_path, monkeypatch):
     assert "生成时间 2026-10-20 08:30" in content
     assert "盘前" in content
     assert "数据源：搜索/2·资讯池/3" in content
+
+
+# ---------------------------------------------------------------------------
+# 发送失败 → 释放 claim 可补发（OR-COR-4c0e3220/e2e5dd13）
+# 与 force 不绕过持久化 claim（OR-COR-860c1e1a）
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_send_failure_releases_claim_and_fails(tmp_path, monkeypatch):
+    """所有渠道发送失败：状态为 failed、释放当日 claim，窗口内恢复后可补发。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda check_date: True)
+    config = _config(tmp_path)
+    failing = StubNotifier(send_result=False)
+    first = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(
+            available=True, responses=[_search_response(_search_item("早盘消息", "https://n.cn/9"))]
+        ),
+        intelligence_service=None, notifier=failing, db=StubDb(),
+    )
+    assert first["status"] == "failed"
+    assert first["notified"] is False
+    assert "notification" in (first["reason"] or "")
+    assert _claim_count(config.database_path) == 0, "发送失败必须释放当日 claim"
+
+    # 渠道恢复后：同日可重新 claim 并补发（持久化 claim 不再占用）
+    working = StubNotifier()
+    second = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET.replace(hour=8, minute=50),
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=working, db=StubDb(),
+    )
+    assert second["status"] == "success"
+    assert second["notified"] is True
+    assert len(working.calls) == 1
+    assert _claim_count(config.database_path) == 1
+
+
+def test_run_once_send_failure_still_reports_generated_content(tmp_path, monkeypatch):
+    """失败结果仍带回已生成 report（CLI 打印可见），但 notified=False。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda check_date: True)
+    result = run_news_digest_once(
+        _config(tmp_path), now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=StubNotifier(send_result=False),
+        db=StubDb(),
+    )
+    assert result["status"] == "failed"
+    assert result.get("report")
+    assert "# 消息面汇总" in result["report"]
+
+
+def test_force_does_not_repush_on_already_claimed_day(tmp_path, monkeypatch):
+    """force 不得绕过同日至多一次的持久化保证：已推送当日不重发，但仍生成内容。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda check_date: True)
+    config = _config(tmp_path)
+    notifier = StubNotifier()
+    first = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(
+            available=True, responses=[_search_response(_search_item("早盘消息", "https://n.cn/9"))]
+        ),
+        intelligence_service=None, notifier=notifier, db=StubDb(),
+    )
+    assert first["status"] == "success" and first["notified"] is True
+    assert len(notifier.calls) == 1
+
+    # 同日窗口外 force 重跑（CLI 预览场景）：不重发、claim 保持占用、内容仍生成
+    second = run_news_digest_once(
+        config, now=TUESDAY_AFTER_WINDOW,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=notifier, db=StubDb(),
+        force=True,
+    )
+    assert second["status"] == "success"
+    assert second["notified"] is False
+    assert "claim" in (second["reason"] or "")
+    assert second.get("report"), "force 已推送当日仍需返回已生成内容供打印"
+    assert len(notifier.calls) == 1, "同日 force 不得重复推送"
+    assert _claim_count(config.database_path) == 1
+
+
+def test_force_fresh_day_sends_and_claims(tmp_path, monkeypatch):
+    """force 在当日未推送时：正常 claim → 发送 → 占用（与常规路径同一机制）。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda check_date: True)
+    config = _config(tmp_path)
+    notifier = StubNotifier()
+    result = run_news_digest_once(
+        config, now=TUESDAY_AFTER_WINDOW,  # 窗口外：force 跳过窗口判定
+        search_service=StubSearchService(
+            available=True, responses=[_search_response(_search_item("早盘消息", "https://n.cn/9"))]
+        ),
+        intelligence_service=None, notifier=notifier, db=StubDb(),
+        force=True,
+    )
+    assert result["status"] == "success"
+    assert result["notified"] is True
+    assert len(notifier.calls) == 1
+    assert _claim_count(config.database_path) == 1
+
+
+def test_force_send_failure_releases_claim_allows_resend(tmp_path, monkeypatch):
+    """blocker 1×3 联动：force 发送失败 → 释放 claim → 再次 force 可补发。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda check_date: True)
+    config = _config(tmp_path)
+    failing = StubNotifier(send_result=False)
+    first = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=failing, db=StubDb(),
+        force=True,
+    )
+    assert first["status"] == "failed"
+    assert _claim_count(config.database_path) == 0
+
+    working = StubNotifier()
+    second = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET.replace(hour=8, minute=50),
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=working, db=StubDb(),
+        force=True,
+    )
+    assert second["status"] == "success" and second["notified"] is True
+    assert len(working.calls) == 1

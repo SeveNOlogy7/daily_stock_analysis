@@ -3,9 +3,10 @@
 
 设计要点（详见计划 D1-D14）：
 - 触发模型：后台轮询 tick 调 ``run_news_digest_once(config, now=...)``，时钟注入，
-  窗口判定为纯函数；每日一份语义由独立 SQLite claim 表保证。
-- fail-open 链：搜索腿 / 资讯池腿 / LLM 摘要 / 落库 / 通知 任一失败都降级为
-  模板摘要或跳过，``run_news_digest_once`` 永不向上抛异常。
+  窗口判定为纯函数；每日一份语义由独立 SQLite claim 表保证（跨进程/重启成立）。
+- fail-open 链：搜索腿 / 资讯池腿 / LLM 摘要 / 落库任一失败都降级为模板摘要或
+  跳过，``run_news_digest_once`` 永不向上抛异常；通知发送失败视为本次出报失败
+  ——释放当日 claim 返回 failed，窗口内下一 tick（或再次 force）补发。
 - 不可信输入边界（D12）：外部新闻文本在 ``NewsDigestEntry`` 构造时逐字段截断
   （90/220/60/180）并剥控制字符；入 prompt ≤6 条；正文 ≤NEWS_DIGEST_MAX_NEWS。
 
@@ -853,7 +854,15 @@ def run_news_digest_once(
     """跑一次消息面汇总；永不向上抛异常，返回 ``{"status": ..., "reason": ...}``。
 
     流程：enabled 检查 → 窗口判定 → claim-first → 双腿数据组装 → LLM/模板摘要
-    → 落库 → 推送；未预期异常释放 claim 并返回 failed，窗口内下一 tick 重试。
+    → 落库 → 推送；未预期异常或通知发送失败释放 claim 并返回 failed，
+    窗口内下一 tick（或再次 force）重新 claim 补发。
+
+    claim 语义（OR-COR-4c0e3220 / OR-COR-860c1e1a）：
+    - 同日"至多推送一次"由持久化 claim 保证（跨进程/重启成立），force 也不绕过；
+    - force 只绕过 enabled/窗口/已推送三条短路：当日已 claim（已成功推送）→
+      不重发，仅组装并返回内容供 CLI 打印；当日未 claim → 照常 claim 后发送；
+    - 发送失败（``send`` 返回 False，含所有渠道失败被吞的场景）与未预期异常
+      同等对待：释放本次 claim，等待补发。
     """
     region = _resolve_region(config)
     date_key = now.strftime("%Y-%m-%d")
@@ -889,21 +898,35 @@ def run_news_digest_once(
                 "region": region, "date": date_key,
             }
 
-    if not force:
+    # claim-first：常规与 force 同一原子占位机制；claim 失败宁可不出也不重复推送。
+    try:
+        acquired = claim_news_digest_date(database_path, date_key, region, context.kind)
+    except Exception as exc:  # noqa: BLE001 - claim 失败宁可不出也不重复推送
+        logger.error("NEWS_DIGEST claim 失败，本次不出汇总: %s", exc)
+        return {
+            "status": "failed", "reason": "claim_error",
+            "region": region, "date": date_key, "context": context.kind,
+        }
+    already_claimed = not acquired
+    claimed_here = bool(acquired)
+    if already_claimed and not force:
+        logger.info("NEWS_DIGEST 本自然日已出汇总，跳过（claim 命中）")
+        return {
+            "status": "skipped", "reason": "already_claimed",
+            "region": region, "date": date_key, "context": context.kind,
+        }
+    if already_claimed and force:
+        logger.info("NEWS_DIGEST force：本自然日已推送，不重发（仅生成内容供展示）")
+
+    def _release_claim_safely() -> None:
+        # 仅释放本次运行获得的 claim：已推送当日的 claim（他人/此前运行所有）
+        # 在失败路径不得被误释放，否则会打开重复推送窗口。
+        if not claimed_here:
+            return
         try:
-            acquired = claim_news_digest_date(database_path, date_key, region, context.kind)
-        except Exception as exc:  # noqa: BLE001 - claim 失败宁可不出也不重复推送
-            logger.error("NEWS_DIGEST claim 失败，本次不出汇总: %s", exc)
-            return {
-                "status": "failed", "reason": "claim_error",
-                "region": region, "date": date_key, "context": context.kind,
-            }
-        if not acquired:
-            logger.info("NEWS_DIGEST 本自然日已出汇总，跳过（claim 命中）")
-            return {
-                "status": "skipped", "reason": "already_claimed",
-                "region": region, "date": date_key, "context": context.kind,
-            }
+            release_news_digest_date(database_path, date_key, region, context.kind)
+        except Exception as release_exc:  # noqa: BLE001 - release 本身 best-effort
+            logger.warning("NEWS_DIGEST 释放 claim 失败: %s", release_exc)
 
     try:
         topics = parse_news_digest_topics(getattr(config, "news_digest_topics", None))
@@ -938,23 +961,37 @@ def run_news_digest_once(
             context=context, language=language, date_key=date_key,
             entries_count=len(entries),
         )
+
+        def _result(status: str, reason: Optional[str], notified: bool) -> Dict[str, Any]:
+            return {
+                "status": status, "reason": reason, "region": region,
+                "date": date_key, "context": context.kind,
+                "entries_count": len(entries), "search_ok": search_ok,
+                "feed_ok": feed_ok, "summarized": bool(summary_text),
+                "notified": notified, "history_id": int(history_id or 0),
+                # D11：CLI 一次性入口需要把 Markdown 摘要打印到 stdout；调度
+                # tick 日志只取标量字段，不回显全文。
+                "report": report,
+            }
+
+        if already_claimed:
+            # force 预览：当日已成功推送（持久化 claim 占用中），不再重发，
+            # 仅返回生成内容；本次异常/失败也不得释放他人的 claim。
+            return _result("success", "already_claimed", False)
+
         notified = _send_digest_notification(notifier, report, region, date_key)
-        return {
-            "status": "success", "reason": None, "region": region,
-            "date": date_key, "context": context.kind,
-            "entries_count": len(entries), "search_ok": search_ok,
-            "feed_ok": feed_ok, "summarized": bool(summary_text),
-            "notified": bool(notified), "history_id": int(history_id or 0),
-            # D11：CLI 一次性入口需要把 Markdown 摘要打印到 stdout（即使通知层
-            # 被 dedup_key 吞掉）；调度 tick 日志只取标量字段，不回显全文。
-            "report": report,
-        }
-    except Exception as exc:  # noqa: BLE001 - 未预期异常：释放 claim，不上抛
+        if not notified:
+            # 发送失败（NotificationService 所有渠道失败返回 False）视为本次
+            # 出报失败：释放 claim，窗口内下一 tick / 再次 force 可重新补发。
+            logger.error(
+                "NEWS_DIGEST 通知发送失败，释放 claim 待窗口内补发: date_key=%s", date_key,
+            )
+            _release_claim_safely()
+            return _result("failed", "notification_failed", False)
+        return _result("success", None, True)
+    except Exception as exc:  # noqa: BLE001 - 未预期异常：释放本次 claim，不上抛
         logger.error("NEWS_DIGEST 未预期异常，释放 claim 待窗口内重试: %s", exc)
-        try:
-            release_news_digest_date(database_path, date_key, region, context.kind)
-        except Exception as release_exc:  # noqa: BLE001 - release 本身 best-effort
-            logger.warning("NEWS_DIGEST 释放 claim 失败: %s", release_exc)
+        _release_claim_safely()
         return {
             "status": "failed",
             "reason": f"unexpected_error: {type(exc).__name__}",
