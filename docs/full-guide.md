@@ -1152,8 +1152,8 @@ crontab -e
 
 在非交易时段推送一份 A 股宏观消息面摘要（默认关闭，设 `NEWS_DIGEST_ENABLED=true` 开启）：
 
-- **触发时机**：后台任务按 `NEWS_DIGEST_INTERVAL_MINUTES` 轮询并自判时段——交易日仅盘前窗口（`NEWS_DIGEST_PREMARKET_WINDOW`，默认 08:00-09:15）产出；周末与节假日在 `NEWS_DIGEST_OFFDAY_WINDOW`（默认 09:00-18:00）产出。每个自然日最多一份（本地 claim 记录 + 通知层 `dedup_key` 双重去重，进程重启不重复推送）。
-- **双模式生效**：CLI 定时模式（`--schedule`）与 Web/API runtime scheduler 均自动挂载（Web 模式需开启定时任务）；手动预览用 `python main.py --news-digest`，摘要 Markdown 直接打印到终端，同日已推送过则通知层自动去重。
+- **触发时机**：后台任务按 `NEWS_DIGEST_INTERVAL_MINUTES` 轮询并自判时段——交易日仅盘前窗口（`NEWS_DIGEST_PREMARKET_WINDOW`，默认 08:00-09:15）产出；周末与节假日在 `NEWS_DIGEST_OFFDAY_WINDOW`（默认 09:00-18:00）产出。每个自然日最多一份（SQLite 持久化 claim 保证，跨进程/重启不重复推送；通知层 `dedup_key` 为进程内第二道防线）。通知发送失败会自动释放当日 claim，窗口内下一轮询（或再次手动触发）补发。
+- **双模式生效**：CLI 定时模式（`--schedule`）与 Web/API runtime scheduler 均自动挂载（Web 模式需开启定时任务）；手动预览用 `python main.py --news-digest`，真实抓取搜索/资讯池并生成摘要打印到终端；同日已推送过则只生成/打印内容，不再重复推送（持久化 claim 去重）。
 - **内容来源**：`NEWS_DIGEST_TOPICS` 主题搜索（复用搜索服务渠道降级链）+ 本地资讯池（近 48 小时），合并去重后取前 `NEWS_DIGEST_MAX_NEWS` 条；LLM 生成摘要，不可用时回退模板。
 - **降级语义（fail-open）**：未配置搜索能力且资讯池为空 → 输出含披露文案的模板占位，不报错；exchange-calendars 未安装时节假日按交易日处理（仅影响窗口选择，周末判定不受影响）；`NEWS_DIGEST_REGION` 当前仅支持 `cn`。
 - **记录与安全**：每份汇总以 `report_type=news_digest` 写入分析历史（历史页可查）；新闻文本视为不可信输入——入 LLM 前限条数并逐字段截断，摘要不回流个股分析 Prompt。
