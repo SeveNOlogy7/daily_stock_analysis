@@ -8,9 +8,11 @@ Full matrix (W1-plan T6-T9) is completed by the downstream W2-tests task.
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from types import SimpleNamespace
 from typing import Dict
+from unittest.mock import patch
 
 import pytest
 
@@ -220,3 +222,94 @@ class TestCacheAndSwitch:
         service = CrossAssetContextService(fetcher=fetcher)
         service.get_context("CN", TRADE_DATE)
         assert fetcher.seen_markets[0][0] == "cn"
+
+
+class TestManagedFetcherConfigReload:
+    """Runtime config reload must reach the service-managed fetcher.
+
+    PR #2428 review blocker OR-COR-cross-asset-config-reload: the process-wide
+    service kept the first CrossAssetFetcher forever, so editing
+    CROSS_ASSET_CONTEXT_TIMEOUT_SECONDS / CROSS_ASSET_CONTEXT_STALE_DAYS via
+    the Web settings page (or the schedule config reload) never took effect
+    until a process restart.
+    """
+
+    @staticmethod
+    def _config(timeout_seconds, stale_days):
+        return SimpleNamespace(
+            cross_asset_context_enabled=True,
+            cross_asset_context_timeout_seconds=timeout_seconds,
+            cross_asset_context_stale_days=stale_days,
+        )
+
+    @staticmethod
+    def _patch_fetcher_factory(created):
+        def _factory(**kwargs):
+            fetcher = _StubFetcher()
+            fetcher.params = (kwargs["timeout_seconds"], kwargs["stale_days"])
+            created.append(fetcher)
+            return fetcher
+
+        return patch(
+            "data_provider.cross_asset_fetcher.CrossAssetFetcher",
+            side_effect=_factory,
+        )
+
+    def test_settings_change_rebuilds_managed_fetcher(self):
+        created = []
+        service = CrossAssetContextService()
+
+        with self._patch_fetcher_factory(created):
+            service.get_context("cn", TRADE_DATE, config=self._config(8, 2))
+            # different trade_date bypasses the per-(market, day) context cache
+            service.get_context("cn", date(2026, 10, 23), config=self._config(1, 30))
+
+        assert [fetcher.params for fetcher in created] == [(8, 2), (1, 30)]
+
+    def test_unchanged_settings_reuse_managed_fetcher(self):
+        created = []
+        service = CrossAssetContextService()
+
+        with self._patch_fetcher_factory(created):
+            service.get_context("cn", TRADE_DATE, config=self._config(8, 2))
+            service.get_context("cn", date(2026, 10, 23), config=self._config(8, 2))
+
+        assert len(created) == 1
+
+    def test_injected_fetcher_is_never_replaced(self):
+        fetcher = _StubFetcher()
+        service = CrossAssetContextService(fetcher=fetcher)
+        created = []
+
+        with self._patch_fetcher_factory(created):
+            service.get_context("cn", TRADE_DATE, config=self._config(8, 2))
+            service.get_context("cn", date(2026, 10, 23), config=self._config(1, 30))
+
+        assert created == []
+        assert fetcher.calls == 2
+
+    def test_real_config_env_change_reaches_managed_fetcher(self, monkeypatch):
+        """Project convention (monkeypatch.setenv + Config reload): a real
+        Config re-parsed from edited env vars must drive the next fetch."""
+        from src.config import Config
+
+        created = []
+        service = CrossAssetContextService()
+
+        with patch("src.config.setup_env"), \
+             patch.object(Config, "_parse_litellm_yaml", return_value=[]), \
+             patch.object(Config, "_parse_stock_email_groups", return_value=[]):
+            monkeypatch.setenv("CROSS_ASSET_CONTEXT_TIMEOUT_SECONDS", "8")
+            monkeypatch.setenv("CROSS_ASSET_CONTEXT_STALE_DAYS", "2")
+            with self._patch_fetcher_factory(created):
+                service.get_context("cn", TRADE_DATE, config=Config._load_from_env())
+
+                monkeypatch.setenv("CROSS_ASSET_CONTEXT_TIMEOUT_SECONDS", "1")
+                monkeypatch.setenv("CROSS_ASSET_CONTEXT_STALE_DAYS", "30")
+                with patch.dict(os.environ, {}, clear=False):
+                    fresh_config = Config._load_from_env()
+                service.get_context(
+                    "cn", date(2026, 10, 23), config=fresh_config
+                )
+
+        assert [fetcher.params for fetcher in created] == [(8, 2), (1, 30)]

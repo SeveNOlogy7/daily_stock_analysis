@@ -418,6 +418,13 @@ class CrossAssetContextService:
         cache_ttl_seconds: float = _CACHE_TTL_SECONDS,
     ) -> None:
         self._fetcher = fetcher
+        # Explicitly injected fetchers (tests / custom wiring) are sticky:
+        # config-driven rebuild below only applies to fetchers this service
+        # created itself.
+        self._fetcher_injected = fetcher is not None
+        # Normalized (timeout, stale) signature of the managed fetcher's
+        # creation settings; ``None`` until the service builds one.
+        self._fetcher_params: Optional[Tuple[float, int]] = None
         self._config = config
         self._cache_ttl_seconds = float(cache_ttl_seconds)
         self._cache: Dict[Tuple[str, str], Tuple[float, CrossAssetContext]] = {}
@@ -488,7 +495,16 @@ class CrossAssetContextService:
     # ------------------------------------------------------------------
     def _get_fetcher(self, config: Any) -> Any:
         if self._fetcher is not None:
-            return self._fetcher
+            if self._fetcher_injected:
+                return self._fetcher
+            # Managed fetcher: re-read the timeout/stale settings on every
+            # call so a runtime config reload (Web settings page / schedule
+            # reload) takes effect without a process restart (PR #2428
+            # review). Rebuild only when the effective values actually
+            # changed; the per-(market, day) context cache above keeps
+            # same-day reads untouched either way.
+            if self._fetcher_params == self._resolve_fetcher_params(config):
+                return self._fetcher
         from data_provider.cross_asset_fetcher import CrossAssetFetcher
 
         timeout_seconds = getattr(config, "cross_asset_context_timeout_seconds", 8)
@@ -497,7 +513,28 @@ class CrossAssetContextService:
             timeout_seconds=timeout_seconds,
             stale_days=stale_days,
         )
+        self._fetcher_params = self._resolve_fetcher_params(config)
         return self._fetcher
+
+    @staticmethod
+    def _resolve_fetcher_params(config: Any) -> Tuple[float, int]:
+        """Normalized (timeout, stale) signature for reload detection.
+
+        Mirrors ``CrossAssetFetcher.__init__`` clamping so equivalent raw
+        values (e.g. ``0`` timeout vs the clamped ``1.0``) do not trigger
+        pointless rebuilds.
+        """
+        timeout_seconds = getattr(config, "cross_asset_context_timeout_seconds", 8)
+        stale_days = getattr(config, "cross_asset_context_stale_days", 2)
+        try:
+            timeout_seconds = max(1.0, float(timeout_seconds))
+        except (TypeError, ValueError):
+            timeout_seconds = 8.0
+        try:
+            stale_days = max(0, int(stale_days))
+        except (TypeError, ValueError):
+            stale_days = 2
+        return timeout_seconds, stale_days
 
     def _cache_get(self, key: Tuple[str, str]) -> Optional[CrossAssetContext]:
         with self._lock:
