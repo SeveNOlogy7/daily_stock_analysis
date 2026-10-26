@@ -124,6 +124,7 @@ class StubDb:
         self.saved = []
         self._history_id = history_id
         self._error = error
+        self._next_id = history_id
 
     def save_analysis_history(
         self, result=None, query_id="", report_type="", news_content=None,
@@ -131,8 +132,11 @@ class StubDb:
     ):
         if self._error is not None:
             raise self._error
+        row_id = self._next_id
+        self._next_id += 1
         self.saved.append(
             {
+                "id": row_id,
                 "result": result,
                 "query_id": query_id,
                 "report_type": report_type,
@@ -140,7 +144,20 @@ class StubDb:
                 "context_snapshot": context_snapshot,
             }
         )
-        return self._history_id
+        return row_id
+
+    def get_latest_analysis_history_id(
+        self, *, query_id="", code="", report_type="",
+    ):
+        """与 DatabaseManager.get_latest_analysis_history_id 同契约的内存实现。"""
+        for row in reversed(self.saved):
+            if (
+                row["query_id"] == query_id
+                and row["report_type"] == report_type
+                and getattr(row["result"], "code", None) == code
+            ):
+                return row["id"]
+        return None
 
 
 def _search_item(title, url, snippet="摘要内容", source="新浪财经", published_date=None):
@@ -865,3 +882,85 @@ def test_force_send_failure_releases_claim_allows_resend(tmp_path, monkeypatch):
     )
     assert second["status"] == "success" and second["notified"] is True
     assert len(working.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 每日单份持久化历史（OR-COR-7f5b2d19）：失败重试与 force 预览不重复落库
+# ---------------------------------------------------------------------------
+
+
+class LegacyOnlySaveDb:
+    """仅实现 save_analysis_history 的旧版落库桩：无同日查询能力（fail-open 覆盖面）。"""
+
+    def __init__(self):
+        self.saved = []
+
+    def save_analysis_history(self, **kwargs):
+        self.saved.append(kwargs)
+        return 202
+
+
+def test_send_failure_retry_persists_history_once(tmp_path, monkeypatch):
+    """发送失败释放 claim 后同日补发成功：分析历史仍只有一份（幂等复用首记录）。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda d: True)
+    config = _config(tmp_path)
+    db = StubDb()
+    first = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None,
+        notifier=StubNotifier(send_result=False), db=db,
+    )
+    assert first["status"] == "failed"
+    assert first["notified"] is False
+    assert len(db.saved) == 1, "首次尝试生成摘要应落库一份"
+
+    second = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET.replace(hour=8, minute=50),
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=StubNotifier(), db=db,
+    )
+    assert second["status"] == "success" and second["notified"] is True
+    assert len(db.saved) == 1, "补发成功后当日历史必须仍只有一份，不得重复落库"
+    assert second["history_id"] == first["history_id"], "重试应复用首次持久化记录"
+    assert _claim_count(config.database_path) == 1
+
+
+def test_force_preview_writes_no_history_on_already_claimed_day(tmp_path, monkeypatch):
+    """当日已推送后 CLI force 预览是只读动作：不写分析历史（OR-COR-7f5b2d19）。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda d: True)
+    config = _config(tmp_path)
+    db = StubDb()
+    first = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=StubNotifier(), db=db,
+    )
+    assert first["status"] == "success"
+    assert len(db.saved) == 1
+
+    preview = run_news_digest_once(
+        config, now=TUESDAY_AFTER_WINDOW,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=StubNotifier(), db=db,
+        force=True,
+    )
+    assert preview["status"] == "success"
+    assert "claim" in (preview["reason"] or "")
+    assert preview.get("report"), "预览仍需返回生成内容供 CLI 打印"
+    assert len(db.saved) == 1, "预览是只读动作，不得写入分析历史"
+    assert preview["history_id"] == 0, "预览结果不携带本次落库 id"
+
+
+def test_history_idempotency_lookup_missing_fails_open(tmp_path, monkeypatch):
+    """落库通道无同日查询能力时退回直接落库（fail-open），不阻断推送链路。"""
+    monkeypatch.setattr(news_digest_service, "_default_is_trading_day", lambda d: True)
+    config = _config(tmp_path)
+    db = LegacyOnlySaveDb()
+    result = run_news_digest_once(
+        config, now=TUESDAY_PREMARKET,
+        search_service=StubSearchService(available=False),
+        intelligence_service=None, notifier=StubNotifier(), db=db,
+    )
+    assert result["status"] == "success"
+    assert len(db.saved) == 1

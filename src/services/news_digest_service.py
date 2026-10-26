@@ -20,7 +20,6 @@ import logging
 import re
 import sqlite3
 import time
-import uuid
 from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass
@@ -738,6 +737,11 @@ def _persist_news_digest_history(
 ) -> int:
     """写入 analysis_history（report_type="news_digest"）；返回 history id（0=未落库）。
 
+    幂等（OR-COR-7f5b2d19）：query_id 为确定性的
+    ``news_digest_{region}_{date_key}``（无随机后缀），写入前先查同日记录，
+    已存在则复用返回、不再插入——失败重试/补发路径不会在历史页累积同日多条。
+    查询能力缺失或查询失败按无记录处理（fail-open），不阻断推送链路。
+
     save_analysis_history 的异常向上传播给 run_news_digest_once 的统一回滚处理；
     真实 DatabaseManager 自身吞错返回 0，此处仅对 0 记 warning（D8）。
     """
@@ -787,7 +791,9 @@ def _persist_news_digest_history(
             analysis_summary=report[:500],
         )
 
-    query_id = f"news_digest_{region}_{date_key}_{uuid.uuid4().hex[:8]}"
+    # OR-COR-7f5b2d19：确定性 query_id（每日一份），先查同日已有记录再插入，
+    # 已存在则复用（失败重试/补发不重复落库）；查询失败按无记录 fail-open。
+    query_id = f"news_digest_{region}_{date_key}"
     context_snapshot = {
         "report_kind": NEWS_DIGEST_REPORT_TYPE,
         "news_digest_region": region,
@@ -795,6 +801,28 @@ def _persist_news_digest_history(
         "report_language": language,
         "entries_count": entries_count,
     }
+    find_existing = getattr(database, "get_latest_analysis_history_id", None)
+    if callable(find_existing):
+        try:
+            existing_id = find_existing(
+                query_id=query_id,
+                code=NEWS_DIGEST_REPORT_TYPE,
+                report_type=NEWS_DIGEST_REPORT_TYPE,
+            )
+        except Exception as exc:  # noqa: BLE001 - 幂等查询失败退回直接落库
+            logger.warning("NEWS_DIGEST 同日历史查询失败，退回直接落库: %s", exc)
+            existing_id = None
+        try:
+            reused_id = int(existing_id or 0)
+        except (TypeError, ValueError):
+            reused_id = 0
+        if reused_id > 0:
+            logger.info(
+                "NEWS_DIGEST 同日已存在持久化摘要（history_id=%s），跳过重复落库",
+                reused_id,
+            )
+            return reused_id
+
     history_id = database.save_analysis_history(
         result=result,
         query_id=query_id,
@@ -860,9 +888,13 @@ def run_news_digest_once(
     claim 语义（OR-COR-4c0e3220 / OR-COR-860c1e1a）：
     - 同日"至多推送一次"由持久化 claim 保证（跨进程/重启成立），force 也不绕过；
     - force 只绕过 enabled/窗口/已推送三条短路：当日已 claim（已成功推送）→
-      不重发，仅组装并返回内容供 CLI 打印；当日未 claim → 照常 claim 后发送；
+      不重发、不落库，仅组装并返回内容供 CLI 打印；当日未 claim → 照常 claim 后发送；
     - 发送失败（``send`` 返回 False，含所有渠道失败被吞的场景）与未预期异常
       同等对待：释放本次 claim，等待补发。
+
+    历史语义（OR-COR-7f5b2d19）：分析历史写入只挂在本次 claim 成功路径上，
+    且按确定性 query_id 幂等（同日已有记录则复用，不再插入）——发送失败重试
+    与同日 force 预览都不会产生第二条当日记录。
     """
     region = _resolve_region(config)
     date_key = now.strftime("%Y-%m-%d")
@@ -956,11 +988,7 @@ def run_news_digest_once(
                 search_ok=search_ok, feed_ok=feed_ok,
             )
 
-        history_id = _persist_news_digest_history(
-            db=db, report=report, region=region, config=config,
-            context=context, language=language, date_key=date_key,
-            entries_count=len(entries),
-        )
+        history_id = 0
 
         def _result(status: str, reason: Optional[str], notified: bool) -> Dict[str, Any]:
             return {
@@ -975,9 +1003,16 @@ def run_news_digest_once(
             }
 
         if already_claimed:
-            # force 预览：当日已成功推送（持久化 claim 占用中），不再重发，
-            # 仅返回生成内容；本次异常/失败也不得释放他人的 claim。
+            # force 预览（OR-COR-7f5b2d19）：当日已成功推送（持久化 claim 占用
+            # 中），不再重发，也不写分析历史——预览是只读动作，历史写入只挂在
+            # 本次 claim 成功路径上；本次异常/失败也不得释放他人的 claim。
             return _result("success", "already_claimed", False)
+
+        history_id = _persist_news_digest_history(
+            db=db, report=report, region=region, config=config,
+            context=context, language=language, date_key=date_key,
+            entries_count=len(entries),
+        )
 
         notified = _send_digest_notification(notifier, report, region, date_key)
         if not notified:
