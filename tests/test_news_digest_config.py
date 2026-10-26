@@ -197,3 +197,21 @@ def test_topics_empty_string_kept_raw_config_side(news_digest_config):
         "外围市场",
         "行业利好",
     ]
+
+
+def test_docs_mention_all_seven_env_keys():
+    """双语 full-guide 必须覆盖全部 7 个 NEWS_DIGEST_ 键（计划 R14：文档与 registry 口径防漂移）。"""
+    repo_root = Path(__file__).resolve().parents[1]
+    expected = {
+        "NEWS_DIGEST_ENABLED",
+        "NEWS_DIGEST_PREMARKET_WINDOW",
+        "NEWS_DIGEST_OFFDAY_WINDOW",
+        "NEWS_DIGEST_TOPICS",
+        "NEWS_DIGEST_MAX_NEWS",
+        "NEWS_DIGEST_INTERVAL_MINUTES",
+        "NEWS_DIGEST_REGION",
+    }
+    for doc in ("docs/full-guide.md", "docs/full-guide_EN.md"):
+        text = (repo_root / doc).read_text(encoding="utf-8")
+        missing = sorted(key for key in expected if key not in text)
+        assert missing == [], f"{doc} missing env keys: {missing}"
