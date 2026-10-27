@@ -508,7 +508,14 @@ class CrossAssetFetcher:
         rate_date = getattr(row, "rate_date", None)
         if not isinstance(rate_date, date):
             return None
-        stale = (as_of - rate_date).days > self._stale_days
+        # OR-COR-cross-asset-fx-cache-stale (issue #1910): the portfolio
+        # refresh fallback copies the last known rate onto the target date
+        # with is_stale=True; a same-day row passes any date-distance check,
+        # so the row's own flag must be honored or the degradation the
+        # upstream service recorded is silently lost on read.
+        stale = bool(getattr(row, "is_stale", False)) or (
+            (as_of - rate_date).days > self._stale_days
+        )
         return row, stale
 
     def _get_fx_repo(self) -> Any:

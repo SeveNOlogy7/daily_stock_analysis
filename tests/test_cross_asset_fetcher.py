@@ -19,11 +19,15 @@ Plus the FX cache-first contract (portfolio cache hit / stale / miss / broken).
 from __future__ import annotations
 
 import itertools
+import os
 import sys
+import tempfile
 import threading
 import time
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 from unittest.mock import MagicMock, patch
@@ -31,7 +35,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from data_provider.cross_asset_fetcher import CrossAssetFetcher
+from src.config import Config
+from src.repositories.portfolio_repo import PortfolioRepository
 from src.schemas.cross_asset_context import CROSS_ASSET_GROUPS
+from src.services.cross_asset_context_service import build_data_quality
+from src.services.portfolio_service import PortfolioService
+from src.storage import DatabaseManager
 
 TRADE_DATE = date(2026, 10, 22)
 FRESH_AS_OF = TRADE_DATE
@@ -530,3 +539,108 @@ class TestBudgetDeadlineIsolation:
             for group in CROSS_ASSET_GROUPS:
                 for item in snapshot[group].values():
                     _assert_quadruple(item)
+
+
+class TestPortfolioFallbackStalePropagation(unittest.TestCase):
+    """OR-COR-cross-asset-fx-cache-stale (issue #1910, PR #2428 review).
+
+    Production fallback: when the portfolio service cannot refresh a pair
+    online it copies the last known rate onto the target date with
+    ``is_stale=True`` (``portfolio_service._refresh_account_fx_rates``).
+    The cross-asset reader must honor that flag — not only the
+    ``rate_date`` distance — and the FX group quality must carry the
+    degradation (``stale`` + ``{group}:stale_data`` limitation), while the
+    item keeps the ``source`` / ``as_of`` / ``stale`` / ``error`` contract.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        env_path = Path(self.temp_dir.name) / ".env"
+        db_path = Path(self.temp_dir.name) / "fx_stale_test.db"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "STOCK_LIST=600519",
+                    "GEMINI_API_KEY=test",
+                    "ADMIN_AUTH_ENABLED=false",
+                    f"DATABASE_PATH={db_path}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.environ["ENV_FILE"] = str(env_path)
+        os.environ["DATABASE_PATH"] = str(db_path)
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        self.repo = PortfolioRepository()
+
+    def tearDown(self) -> None:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("ENV_FILE", None)
+        os.environ.pop("DATABASE_PATH", None)
+        self.temp_dir.cleanup()
+
+    def test_refresh_fallback_same_day_stale_row_propagates_to_cross_asset_read(self):
+        # 1. A genuine online rate from three days ago sits in the cache.
+        self.repo.save_fx_rate(
+            from_currency="USD",
+            to_currency="CNH",
+            rate_date=TRADE_DATE - timedelta(days=3),
+            rate=7.10,
+            source="yfinance",
+            is_stale=False,
+        )
+        service = PortfolioService()
+        account = service.create_account(
+            name="us-account", broker="Demo", market="us", base_currency="CNH"
+        )
+        service.record_cash_ledger(
+            account_id=account["id"],
+            event_date=TRADE_DATE - timedelta(days=10),
+            direction="in",
+            amount=1000,
+            currency="USD",
+        )
+
+        # 2. Online refresh finds no data -> fail-open stale fallback.
+        with patch.object(
+            PortfolioService, "_fetch_fx_rate_from_yfinance", new=MagicMock(return_value=None)
+        ):
+            summary = service.refresh_fx_rates(as_of=TRADE_DATE)
+        assert summary["stale_count"] == 1
+        assert summary["updated_count"] == 0
+        assert summary["error_count"] == 0
+
+        # 3. The production fallback record: same-day rate_date, is_stale=True.
+        row = self.repo.get_latest_fx_rate(
+            from_currency="USD", to_currency="CNH", as_of=TRADE_DATE
+        )
+        assert row is not None
+        assert row.rate_date == TRADE_DATE
+        assert row.is_stale is True
+
+        # 4. Cross-asset read must inherit the degradation, not report a
+        #    fresh same-day rate. Cache-first: yfinance must not be hit.
+        fetcher = CrossAssetFetcher(fx_repo=self.repo, stale_days=2)
+        with patch.object(
+            CrossAssetFetcher,
+            "_fetch_yf_series",
+            new=staticmethod(MagicMock(side_effect=AssertionError("cache row must win"))),
+        ):
+            snapshot = fetcher.fetch_market_snapshot("cn", TRADE_DATE)
+
+        item = snapshot["fx"]["USDCNH"]
+        _assert_quadruple(item)
+        assert item.status == "ok"
+        assert item.value == pytest.approx(7.10)
+        assert item.as_of == TRADE_DATE.isoformat()
+        assert item.source.startswith("portfolio_cache:")
+        assert item.error is None
+        assert item.stale is True  # <-- RED before the fix
+
+        # 5. Group-level quality statistics carry the degradation.
+        quality = build_data_quality(snapshot)
+        assert quality.fx.stale is True
+        assert "fx:stale_data" in quality.limitations
