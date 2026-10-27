@@ -1353,12 +1353,35 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     def __init__(self, db_url: Optional[str] = None):
         """
         初始化数据库管理器
-        
+
         Args:
             db_url: 数据库连接 URL（可选，默认从配置读取）
         """
         if getattr(self, '_initialized', False):
-            return
+            # 单例已初始化：仅当请求的 db_url 与当前绑定的 db_url 不同时才重新
+            # 绑定到新库（先释放旧引擎再重新初始化），否则维持现有实例。
+            # 此前任何新的 db_url 都会被忽略，导致测试/多库场景下实例仍指向
+            # 旧库（issue #2436）。
+            requested_db_url = db_url
+            if requested_db_url is None:
+                requested_db_url = get_config().get_db_url()
+            if requested_db_url == getattr(self, '_db_url', None):
+                return
+
+            logger.info(
+                "DatabaseManager 检测到不同的 db_url，重新绑定: %r -> %r",
+                getattr(self, '_db_url', None),
+                requested_db_url,
+            )
+            old_engine = getattr(self, '_engine', None)
+            self._initialized = False
+            if old_engine is not None:
+                try:
+                    old_engine.dispose()
+                except Exception as dispose_exc:
+                    logger.warning("重新绑定 db_url 时旧引擎清理失败: %s", dispose_exc)
+            # 复用已解析的目标 URL，走下方的完整初始化流程
+            db_url = requested_db_url
 
         created_engine = None
 

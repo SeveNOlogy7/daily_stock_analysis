@@ -10,7 +10,7 @@ from datetime import date
 from unittest.mock import patch
 
 import pandas as pd
-from sqlalchemy import and_, create_engine as sqlalchemy_create_engine, inspect, select
+from sqlalchemy import and_, create_engine as sqlalchemy_create_engine, inspect, select, text
 from sqlalchemy.sql import func
 
 # Ensure src module can be imported
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.config import Config
 from src.storage import (
     Base, CHAT_STATE_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION,
-    DatabaseManager, DatabaseSchemaMigration, StockDaily,
+    ConversationSessionState, DatabaseManager, DatabaseSchemaMigration, StockDaily,
 )
 from src.services import stock_list_parser as stock_list_parser_module
 
@@ -56,6 +56,143 @@ class TestStorage(unittest.TestCase):
                         index_columns.append(column_name)
                 unique_indexes[index_name] = index_columns
             return unique_indexes
+
+    def test_singleton_rebinds_when_different_db_url_requested(self) -> None:
+        """Regression (issue #2436): requesting a different db_url must rebind
+        the singleton (dispose the old engine, re-initialize against the new
+        URL) instead of being silently ignored."""
+        DatabaseManager.reset_instance()
+        dir_a = tempfile.TemporaryDirectory()
+        dir_b = tempfile.TemporaryDirectory()
+
+        try:
+            url_a = f"sqlite:///{os.path.join(dir_a.name, 'a.db')}"
+            url_b = f"sqlite:///{os.path.join(dir_b.name, 'b.db')}"
+
+            first = DatabaseManager(db_url=url_a)
+            old_engine = first._engine
+            dispose_calls = []
+            original_dispose = old_engine.dispose
+
+            def _spy_dispose(*args, **kwargs):
+                dispose_calls.append(True)
+                return original_dispose(*args, **kwargs)
+
+            old_engine.dispose = _spy_dispose
+
+            rebound = DatabaseManager(db_url=url_b)
+
+            # Process-level singleton semantics preserved: same object, re-bound.
+            self.assertIs(rebound, first)
+            self.assertIs(rebound, DatabaseManager._instance)
+            self.assertEqual(rebound._db_url, url_b)
+            self.assertIsNot(rebound._engine, old_engine)
+            self.assertEqual(dispose_calls, [True])
+            # The rebound instance is usable against the new database.
+            with rebound.get_session() as session:
+                session.execute(text("SELECT COUNT(*) FROM conversation_session_states"))
+
+            # Same db_url again: stays the exact same instance and engine.
+            again = DatabaseManager(db_url=url_b)
+            self.assertIs(again, rebound)
+            self.assertIs(again._engine, rebound._engine)
+            self.assertEqual(dispose_calls, [True])
+        finally:
+            DatabaseManager.reset_instance()
+            dir_a.cleanup()
+            dir_b.cleanup()
+
+    def test_new_db_url_wins_after_previous_temp_db_directory_removed(self) -> None:
+        """Regression (issue #2436): CI shard scenario. Test A binds the
+        singleton to a temp-dir database; its directory is deleted at teardown.
+        Test B requests a new db_url and must get an instance bound to it — the
+        stale instance used to survive and raise
+        'no such table: conversation_session_states'."""
+        DatabaseManager.reset_instance()
+        stale_dir = tempfile.TemporaryDirectory()
+        fresh_dir = tempfile.TemporaryDirectory()
+
+        try:
+            stale_url = f"sqlite:///{os.path.join(stale_dir.name, 'shard.db')}"
+            fresh_url = f"sqlite:///{os.path.join(fresh_dir.name, 'shard.db')}"
+
+            stale_db = DatabaseManager(db_url=stale_url)
+            with stale_db.get_session() as session:
+                session.add(ConversationSessionState(
+                    session_id="stale-session", selected_skill_ids_json="[]",
+                ))
+                session.commit()
+
+            # Teardown of test A: release pooled connections, then delete the
+            # whole temporary directory (as CI does).
+            stale_db._engine.dispose()
+            stale_dir.cleanup()
+            self.assertFalse(os.path.exists(stale_dir.name))
+
+            # Test B: the stale singleton (still bound to the removed path) used
+            # to win here; SQLAlchemy would silently recreate an empty file at
+            # the stale path and every query failed with "no such table".
+            fresh_db = DatabaseManager(db_url=fresh_url)
+            self.assertIs(fresh_db, stale_db)
+            self.assertEqual(fresh_db._db_url, fresh_url)
+            # The fresh database exists and is empty (not the stale database).
+            with fresh_db.get_session() as session:
+                self.assertIsNone(session.get(ConversationSessionState, "stale-session"))
+        finally:
+            DatabaseManager.reset_instance()
+            fresh_dir.cleanup()
+
+    def test_same_db_url_keeps_existing_singleton_engine(self) -> None:
+        """Same db_url must keep the process-level singleton untouched."""
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+
+        try:
+            url = f"sqlite:///{os.path.join(temp_dir.name, 'same.db')}"
+            first = DatabaseManager(db_url=url)
+            second = DatabaseManager(db_url=url)
+
+            self.assertIs(second, first)
+            self.assertIs(second._engine, first._engine)
+            self.assertEqual(second._db_url, url)
+        finally:
+            DatabaseManager.reset_instance()
+            temp_dir.cleanup()
+
+    def test_config_resolved_db_url_change_rebinds_singleton(self) -> None:
+        """Regression (issue #2436): the db_url=None path (DatabaseManager()
+        / get_instance()) resolves the URL from the current Config; a changed
+        Config database path must rebind the singleton too."""
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        dir_a = tempfile.TemporaryDirectory()
+        dir_b = tempfile.TemporaryDirectory()
+
+        try:
+            with patch.dict(os.environ, {"DATABASE_PATH": os.path.join(dir_a.name, "cfg.db")}):
+                Config.reset_instance()
+                first = DatabaseManager()
+            # The rebind mutates the shared singleton in place, so snapshot the
+            # bound URL before requesting a different Config path.
+            first_db_url = first._db_url
+
+            with patch.dict(os.environ, {"DATABASE_PATH": os.path.join(dir_b.name, "cfg.db")}):
+                Config.reset_instance()
+                second = DatabaseManager()
+
+            self.assertIs(second, first)
+            self.assertNotEqual(second._db_url, first_db_url)
+            self.assertEqual(
+                second._db_url,
+                f"sqlite:///{os.path.abspath(os.path.join(dir_b.name, 'cfg.db'))}",
+            )
+            with second.get_session() as session:
+                session.execute(text("SELECT COUNT(*) FROM conversation_session_states"))
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            dir_a.cleanup()
+            dir_b.cleanup()
 
     def test_legacy_intelligence_items_url_unique_index_rebuilds_without_collision(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
