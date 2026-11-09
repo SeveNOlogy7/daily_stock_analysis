@@ -1,0 +1,35 @@
+{
+  "generatedAt": "2026-11-09T05:59:30.898Z",
+  "scenarios": {
+    "history-data-zh": {
+      "date": "2026-11-09",
+      "rows": 20,
+      "total": 23,
+      "page": 1
+    },
+    "history-page2-zh": {
+      "rows": 3,
+      "total": 23,
+      "page": 2
+    },
+    "history-loading-zh": {
+      "date": "2026-11-07",
+      "staleRowsHidden": true,
+      "loadingVisible": true
+    },
+    "history-empty-zh": {
+      "date": "2026-11-07",
+      "rows": 0
+    },
+    "history-data-en": {
+      "language": "en",
+      "rows": 8,
+      "total": 23
+    },
+    "history-narrow-zh": {
+      "viewportWidth": 420,
+      "rows": 10,
+      "total": 23
+    }
+  }
+}
