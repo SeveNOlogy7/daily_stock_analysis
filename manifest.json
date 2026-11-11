@@ -1,0 +1,37 @@
+{
+  "issue": 771,
+  "pr_branch": "feat/quote-dashboard-771",
+  "component": "apps/dsa-web/src/components/report/QuotePanel.tsx",
+  "endpoint": "GET /api/v1/stocks/{code}/quote",
+  "generated_at": "2026-11-11",
+  "method": "vite build self-contained HTML (inlined CSS+JS, mocked axios adapter with test-equivalent fixtures) + Edge headless screenshot 1280x900",
+  "fixture_source": "apps/dsa-web/src/components/report/__tests__/QuotePanel.test.tsx (FULL_CN_SNAPSHOT / DEGRADED_US_SNAPSHOT / UNAVAILABLE_SNAPSHOT)",
+  "screenshots": [
+    {
+      "file": "quote-panel-data-zh.png",
+      "state": "data (zh, 600519 贵州茅台)",
+      "fixture": "FULL_CN_SNAPSHOT: 22 fields, data_quality=ok, source=akshare_em, currency=CNY; trade_count null by design (em 标准接口无笔数)"
+    },
+    {
+      "file": "quote-panel-degraded-zh.png",
+      "state": "degraded (zh, AAPL)",
+      "fixture": "DEGRADED_US_SNAPSHOT: data_quality=partial, 17 null fields rendered as '—', 部分字段缺失（17）annotation, MA row all '—'"
+    },
+    {
+      "file": "quote-panel-error-zh.png",
+      "state": "error (zh)",
+      "fixture": "adapter rejects 500 {detail: quote provider unavailable} → ApiErrorAlert with 重试 button"
+    },
+    {
+      "file": "quote-panel-en.png",
+      "state": "en language + degraded (AAPL)",
+      "fixture": "DEGRADED_US_SNAPSHOT with language=en: QUOTE SNAPSHOT / Live Quote / Some fields missing (17) / Copy quote / Refresh"
+    },
+    {
+      "file": "quote-panel-empty-zh.png",
+      "state": "empty (zh)",
+      "fixture": "UNAVAILABLE_SNAPSHOT: data_quality=unavailable → 暂无行情数据 empty state block"
+    }
+  ],
+  "fallback_html": "quote-panel-evidence.html — open locally with ?state=data|degraded|error|empty&lang=zh|en|ko query params to reproduce any state"
+}
